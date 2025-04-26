@@ -1,0 +1,58 @@
+# NOTE: we probably should tie that to specific versions, as upgrading in place
+#       is not supported - upgrading should be uninstall + install. See:
+# https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/deploying-runner-scale-sets-with-actions-runner-controller#upgrading-arc
+
+- fail:
+    msg: "github_arc variable is undefined"
+  when: github_arc is undefined
+
+- fail:
+    msg: "github_arc.app_id is undefined"
+  when: github_arc.app_id is undefined
+
+- fail:
+    msg: "github_arc.app_installation_id is undefined"
+  when: github_arc.app_installation_id is undefined
+
+- fail:
+    msg: "github_arc.config_url is undefined"
+  when: github_arc.config_url is undefined
+
+- set_fact:
+    _gh_arc_system_ns: "{{github_arc.system_ns|default('arc-system')}}"
+    _gh_arc_runner_ns: "{{github_arc.system_ns|default('arc-runners')}}"
+    _gh_arc_secret_name: "{{github_arc.secret_name|default('arc-secret')}}"
+
+- name: deploy controller
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{_gh_arc_system_ns}}"
+    create_namespace: true
+    name: "{{github_arc.arc_name|default('arc')}}"
+    chart_ref: "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller"
+    set_values:
+      - value: githubConfigUrl="{{github_arc.config_url}}"
+        value_type: raw
+      - value: githubConfigSecret.github_app_id="{{github_arc.app_id}}"
+        value_type: raw
+      - value: githubConfigSecret.github_app_installation_id="{{github_arc.app_installation_id}}"
+        value_type: raw
+      - value: githubConfigSecret.github_app_private_key="{{github_arc.app_private_key}}"
+        value_type: raw
+
+- name: deploy runners
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{_gh_arc_runner_ns}}"
+    create_namespace: true
+    name: "{{github_arc.arc_runner_name|default('arc-runner-set')}}"
+    chart_ref: "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set"
+    set_values:
+      - value: githubConfigUrl="{{github_arc.config_url}}"
+        value_type: raw
+      - value: githubConfigSecret.github_app_id="{{github_arc.app_id}}"
+        value_type: raw
+      - value: githubConfigSecret.github_app_installation_id="{{github_arc.app_installation_id}}"
+        value_type: raw
+      - value: githubConfigSecret.github_app_private_key="{{github_arc.app_private_key}}"
+        value_type: raw
