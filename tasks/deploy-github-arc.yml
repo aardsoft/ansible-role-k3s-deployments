@@ -61,3 +61,17 @@
     _set.value.state|default('present') == 'present'
   loop_control:
     loop_var: _set
+
+- name: deploy runner scale sets
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{_set.value.ns|default(_gh_arc_runner_ns)}}"
+    create_namespace: true
+    name: "{{_set.value.name|default(_set.key)}}"
+    chart_ref: "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set"
+    state: absent
+  with_dict: "{{github_arc.runner_sets|default('{}')}}"
+  when: >
+    _set.value.state|default('present') == 'absent'
+  loop_control:
+    loop_var: _set
