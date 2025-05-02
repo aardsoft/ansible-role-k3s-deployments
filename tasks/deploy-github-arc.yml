@@ -2,43 +2,61 @@
 #       is not supported - upgrading should be uninstall + install. See:
 # https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/deploying-runner-scale-sets-with-actions-runner-controller#upgrading-arc
 
-- fail:
-    msg: "github_arc variable is undefined"
-  when: github_arc is undefined
+- debug:
+    msg: "{{cfg_values}}"
 
 - fail:
-    msg: "github_arc.app_id is undefined"
-  when: github_arc.app_id is undefined
+    msg: "cfg_values variable is undefined"
+  when: cfg_values is undefined
 
 - fail:
-    msg: "github_arc.app_installation_id is undefined"
-  when: github_arc.app_installation_id is undefined
+    msg: "cfg_values.app_id is undefined"
+  when: cfg_values.app_id is undefined
 
 - fail:
-    msg: "github_arc.config_url is undefined"
-  when: github_arc.config_url is undefined
+    msg: "cfg_values.app_installation_id is undefined"
+  when: cfg_values.app_installation_id is undefined
+
+- fail:
+    msg: "cfg_values.config_url is undefined"
+  when: cfg_values.config_url is undefined
 
 - set_fact:
-    _gh_arc_system_ns: "{{github_arc.system_ns|default('arc-system')}}"
-    _gh_arc_runner_ns: "{{github_arc.system_ns|default('arc-runners')}}"
-    _gh_arc_secret_name: "{{github_arc.secret_name|default('arc-secret')}}"
+    _gh_arc_system_ns: "{{cfg_values.system_ns|default('arc-system')}}"
+    _gh_arc_runner_ns: "{{cfg_values.system_ns|default('arc-runners')}}"
+    _gh_arc_secret_name: "{{cfg_values.secret_name|default('arc-secret')}}"
 
 - name: deploy controller
   kubernetes.core.helm:
     kubeconfig: "{{_k3s_kubecfg}}"
     namespace: "{{_gh_arc_system_ns}}"
     create_namespace: true
-    name: "{{github_arc.arc_name|default('arc')}}"
+    name: "{{cfg_values.arc_name|default('arc')}}"
     chart_ref: "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller"
     set_values:
-      - value: githubConfigUrl="{{github_arc.config_url}}"
+      - value: githubConfigUrl="{{cfg_values.config_url}}"
         value_type: raw
-      - value: githubConfigSecret.github_app_id="{{github_arc.app_id}}"
+      - value: githubConfigSecret.github_app_id="{{cfg_values.app_id}}"
         value_type: raw
-      - value: githubConfigSecret.github_app_installation_id="{{github_arc.app_installation_id}}"
+      - value: githubConfigSecret.github_app_installation_id="{{cfg_values.app_installation_id}}"
         value_type: raw
-      - value: githubConfigSecret.github_app_private_key="{{github_arc.app_private_key}}"
+      - value: githubConfigSecret.github_app_private_key="{{lookup(k3s_passdb, cfg_values.app_private_key_passdb, returnall=true)}}"
         value_type: raw
+
+- name: push runner scale set value templates
+  become: false
+  connection: local
+  local_action:
+    module: ansible.builtin.template
+    mode: 0600
+    src: github-arc-values.yml.j2
+    dest: "{{_gh_arc_debug_path}}/github-arc-values-{{_set.value.name|default(_set.key)}}.yml"
+  with_dict: "{{cfg_values.runner_sets|default('{}')}}"
+  when: >
+    _gh_arc_debug_path is defined and
+    _set.value.state|default('present') == 'present'
+  loop_control:
+    loop_var: _set
 
 - name: deploy runner scale sets
   kubernetes.core.helm:
@@ -47,16 +65,8 @@
     create_namespace: true
     name: "{{_set.value.name|default(_set.key)}}"
     chart_ref: "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set"
-    set_values:
-      - value: githubConfigUrl="{{_set.value.config_url|default(github_arc.config_url)}}"
-        value_type: raw
-      - value: githubConfigSecret.github_app_id="{{_set.value.app_id|default(github_arc.app_id)}}"
-        value_type: raw
-      - value: githubConfigSecret.github_app_installation_id="{{_set.value.app_installation_id|default(github_arc.app_installation_id)}}"
-        value_type: raw
-      - value: githubConfigSecret.github_app_private_key="{{_set.value.app_private_key|default(github_arc.app_private_key)}}"
-        value_type: raw
-  with_dict: "{{github_arc.runner_sets|default('{}')}}"
+    values: "{{ lookup('template', 'github-arc-values.yml.j2') | from_yaml }}"
+  with_dict: "{{cfg_values.runner_sets|default('{}')}}"
   when: >
     _set.value.state|default('present') == 'present'
   loop_control:
@@ -70,7 +80,7 @@
     name: "{{_set.value.name|default(_set.key)}}"
     chart_ref: "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set"
     state: absent
-  with_dict: "{{github_arc.runner_sets|default('{}')}}"
+  with_dict: "{{cfg_values.runner_sets|default('{}')}}"
   when: >
     _set.value.state|default('present') == 'absent'
   loop_control:
