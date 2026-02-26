@@ -1,0 +1,82 @@
+# "Agent" deploys Vector as a DaemonSet (one pod per node for log collection).
+# Other valid roles: Aggregator (StatefulSet), Stateless-Aggregator (Deployment).
+role: Agent
+
+tolerations:
+  - effect: NoSchedule
+    operator: Exists
+
+# Mount the host pod log directory into each Vector instance.
+extraVolumes:
+  - name: pod-logs
+    hostPath:
+      path: /var/log/pods
+
+extraVolumeMounts:
+  - name: pod-logs
+    mountPath: /var/log/pods
+    readOnly: true
+
+# The chart creates a Service by default; disable it since this DaemonSet only
+# ships logs outbound and needs no inbound service ports.
+service:
+  enabled: false
+
+customConfig:
+  data_dir: /vector-data-dir
+
+  sources:
+    pod_logs:
+      type: file
+      include:
+        - /var/log/pods/**/*.log
+      # Ignore files not modified in the last 10 minutes on startup to avoid
+      # re-shipping logs that predate this Vector instance.
+      ignore_older_secs: 600
+
+  transforms:
+    parse_and_enrich:
+      type: remap
+      inputs:
+        - pod_logs
+      source: |-
+        # Parse the CRI (containerd) log line format:
+        #   <timestamp> <stream> <flags> <message>
+        parsed, err = parse_regex(.message, r'^(?P<time>\S+) (?P<stream>stdout|stderr) (?P<flags>\S+) (?P<message>.*)$')
+        if err == null {
+          .time    = parsed.time
+          .stream  = parsed.stream
+          .message = parsed.message
+        }
+
+        # Extract namespace, pod name, and container name from the file path.
+        # Path format: /var/log/pods/<namespace>_<pod>_<uid>/<container>/<n>.log
+        path_parsed, err2 = parse_regex(string!(.file), r'/var/log/pods/(?P<namespace>[^_]+)_(?P<pod>[^_]+)_[^/]+/(?P<container>[^/]+)/\d+\.log')
+        if err2 == null {
+          .kubernetes.namespace_name = path_parsed.namespace
+          .kubernetes.pod_name       = path_parsed.pod
+          .kubernetes.container_name = path_parsed.container
+        }
+
+        .cluster = "{{cfg_values.cluster_label|default('k3s')}}"
+        .job     = "k3s-pod-logs"
+
+  sinks:
+    victorialogs:
+      # VictoriaLogs exposes a Loki-compatible push endpoint.
+      # Vector's loki sink constructs the push URL as:
+      #   {endpoint}/loki/api/v1/push
+      # VictoriaLogs' Loki-compatible ingest path is /insert/loki/api/v1/push,
+      # so we use /insert as the endpoint base.
+      type: loki
+      inputs:
+        - parse_and_enrich
+      endpoint: "http://victorialogs-victoria-logs-single-server.{{cfg_values.namespace|default('logging')}}.svc.cluster.local:9428/insert"
+      encoding:
+        codec: text
+      labels:
+        job: '{% raw %}{{ "{{" }} job {{ "}}" }}{% endraw %}'
+        cluster: '{% raw %}{{ "{{" }} cluster {{ "}}" }}{% endraw %}'
+        namespace: '{% raw %}{{ "{{" }} kubernetes.namespace_name {{ "}}" }}{% endraw %}'
+        pod: '{% raw %}{{ "{{" }} kubernetes.pod_name {{ "}}" }}{% endraw %}'
+        container: '{% raw %}{{ "{{" }} kubernetes.container_name {{ "}}" }}{% endraw %}'

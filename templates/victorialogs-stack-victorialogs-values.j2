@@ -1,0 +1,26 @@
+server:
+  enabled: true
+
+  image:
+    repository: victoriametrics/victoria-logs
+
+  # Retention period: accepts suffixes h (hours), d (days), w (weeks), y (years).
+  retentionPeriod: {{cfg_values.retention_period|default('30d')}}
+
+  persistentVolume:
+    enabled: true
+    storageClass: {{cfg_values.storage_class|default('longhorn')}}
+    size: {{cfg_values.storage_size|default('10Gi')}}
+
+  # Keep the in-cluster service as ClusterIP; external access is provided by
+  # the separate LoadBalancer service created by the deploy task when loki_ip
+  # is defined.
+  service:
+    type: ClusterIP
+
+  extraArgs:
+    # Log in JSON format for structured output.
+    loggerFormat: json
+    # Suppress noisy startup/shutdown messages from the flags library.
+    envflag.enable: "true"
+    envflag.prefix: VM_

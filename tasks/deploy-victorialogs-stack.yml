@@ -1,0 +1,114 @@
+# VictoriaLogs (log storage) + Vector (collector DaemonSet)
+#
+# VictoriaMetrics' log storage engine paired with Vector, a high-performance
+# observability data pipeline from Datadog.
+#
+# Compared to loki this has some advantages:
+#
+# - significantly lower resource footprint
+# - exposes a simple HTTP query API returning structured JSON - ideal for piping
+#   log snippets directly into a LLM for processing
+# - VRL (Vector Remap Language) is useful for log transformation/enrichment
+#   before storage
+# - simple builtin vmui via http
+#
+# It also hase some disadvantages:
+#
+# - smaller community than the Grafana stack; fewer pre-built dashboards
+# - Grafana datasource plugin exists but is less mature than the Loki plugin
+# - Vector's Kubernetes enrichment (pod labels, annotations) requires the
+#   kubernetes_logs source which needs RBAC; file-based collection used here
+#   produces less metadata unless enriched via VRL path parsing
+# - potentially less stable API due to it being quite new
+#
+# LLM query example (after deployment):
+#   curl 'http://<victorialogs_ip>:9428/select/logsql/query' \
+#     --data-urlencode 'query={job="k3s-pod-logs"} _time:1h' | jq .
+#
+# cfg_values keys:
+#   namespace:              Kubernetes namespace              (default: logging)
+#   storage_class:          PVC storage class                (default: longhorn)
+#   storage_size:           VictoriaLogs PVC size            (default: 10Gi)
+#   retention_period:       Log retention period             (default: 30d)
+#   victorialogs_ip:        metallb LoadBalancer IP           (optional)
+#   cluster_label:          Label added to all log streams    (default: k3s)
+#   victorialogs_version:   victoriametrics chart version     (default: latest)
+#   vector_version:         vector/vector chart version       (default: latest)
+#
+# Sample group_vars entry:
+#   k3s:
+#     deployments:
+#       victorialogs-stack:
+#         role: k3s-deployments
+#         name: victorialogs-stack
+#         state: present
+#         config:
+#           namespace: logging
+#           storage_class: longhorn
+#           storage_size: 10Gi
+#           retention_period: 30d
+#           victorialogs_ip: 192.168.33.130
+#           cluster_label: storage1
+
+- name: add VictoriaMetrics Helm repo
+  kubernetes.core.helm_repository:
+    name: victoriametrics
+    repo_url: https://victoriametrics.github.io/helm-charts/
+
+# TODO, we want to support air gapped here
+- name: add Vector Helm repo
+  kubernetes.core.helm_repository:
+    name: vector
+    repo_url: https://helm.vector.dev
+
+- name: deploy VictoriaLogs
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+    create_namespace: true
+    name: victorialogs
+    chart_ref: victoria-logs-single
+    chart_repo_url: https://victoriametrics.github.io/helm-charts/
+    chart_version: "{{cfg_values.victorialogs_version|default(omit)}}"
+    values: "{{lookup('template', 'victorialogs-stack-victorialogs-values.j2') | from_yaml}}"
+
+- name: deploy Vector
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+    create_namespace: true
+    name: vector
+    chart_ref: vector
+    chart_repo_url: https://helm.vector.dev
+    chart_version: "{{cfg_values.vector_version|default(omit)}}"
+    values: "{{lookup('template', 'victorialogs-stack-vector-values.j2') | from_yaml}}"
+
+- name: create LoadBalancer service for external VictoriaLogs access
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: victorialogs-external
+        namespace: "{{cfg_values.namespace|default('logging')}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        type: LoadBalancer
+        loadBalancerIP: "{{cfg_values.victorialogs_ip | ansible.utils.ipaddr('address')}}"
+        selector:
+          app.kubernetes.io/instance: victorialogs
+          app.kubernetes.io/name: victoria-logs-single
+        ports:
+          - name: http
+            port: 9428
+            targetPort: 9428
+            protocol: TCP
+  when: cfg_values.victorialogs_ip is defined

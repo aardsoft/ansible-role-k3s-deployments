@@ -1,0 +1,60 @@
+- name: remove Vector
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+    name: vector
+    state: absent
+
+- name: remove VictoriaLogs
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+    name: victorialogs
+    state: absent
+
+- name: remove LoadBalancer service for external VictoriaLogs access
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: victorialogs-external
+        namespace: "{{cfg_values.namespace|default('logging')}}"
+  when: cfg_values.victorialogs_ip is defined
+
+# Helm does not delete PVCs created by StatefulSets on chart removal.
+- name: query VictoriaLogs PVCs
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    kind: PersistentVolumeClaim
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+    label_selectors:
+      - "app.kubernetes.io/instance=victorialogs"
+  register: _vlogs_pvcs
+
+- name: remove VictoriaLogs PVCs
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: "{{item.metadata.name}}"
+        namespace: "{{cfg_values.namespace|default('logging')}}"
+  loop: "{{_vlogs_pvcs.resources}}"
+  loop_control:
+    label: "{{item.metadata.name}}"
+
+- name: remove namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{cfg_values.namespace|default('logging')}}"
+  when: cfg_values.remove_namespace|default(false)
