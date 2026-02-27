@@ -1,9 +1,26 @@
-# NOTE: we probably should tie that to specific versions, as upgrading in place
-#       is not supported - upgrading should be uninstall + install. See:
-# https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/deploying-runner-scale-sets-with-actions-runner-controller#upgrading-arc
-
-- debug:
-    msg: "{{cfg_values}}"
+# Upgrading ARC (gha-runner-scale-set-controller) in-place is not supported.
+# The upgrade path is: uninstall runner scale sets -> uninstall controller ->
+# reinstall controller -> reinstall runner scale sets.
+#
+# To prevent surprises we don't touch an existing deployment unless explicitly
+# requested: Set cfg_values.upgrade: true for this.
+#
+# Without that flag an existing controller deployment is left untouched, though
+# runner set additions and removals within cfg_values.runner_sets are always applied.
+#
+# cfg_values keys:
+#   arc_name:                  Helm release name for controller  (default: arc)
+#   system_ns:                 Namespace for controller          (default: arc-system)
+#   runner_ns:                 Namespace for runner sets         (default: arc-runners)
+#   secret_name:               Secret name for GitHub auth       (default: arc-secret)
+#   upgrade:                   Force uninstall+reinstall         (default: false)
+#   upgrade_remove_crds:       Also remove actions.github.com CRDs before reinstall
+#                              Required when CRDs changed between versions (default: false)
+#   app_id:                    GitHub App ID                     (required)
+#   app_installation_id:       GitHub App Installation ID        (required)
+#   config_url:                GitHub config URL                 (required)
+#   app_private_key_passdb:    passdb path for GitHub App key    (required)
+#   runner_sets:               dict of runner set configs        (required)
 
 - fail:
     msg: "cfg_values variable is undefined"
@@ -23,8 +40,70 @@
 
 - set_fact:
     _gh_arc_system_ns: "{{cfg_values.system_ns|default('arc-system')}}"
-    _gh_arc_runner_ns: "{{cfg_values.system_ns|default('arc-runners')}}"
+    _gh_arc_runner_ns: "{{cfg_values.runner_ns|default('arc-runners')}}"
     _gh_arc_secret_name: "{{cfg_values.secret_name|default('arc-secret')}}"
+
+- name: check if controller is already deployed
+  kubernetes.core.helm_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    name: "{{cfg_values.arc_name|default('arc')}}"
+    release_namespace: "{{_gh_arc_system_ns}}"
+  register: _arc_helm_info
+  failed_when: false
+
+- set_fact:
+    _arc_is_deployed: "{{_arc_helm_info.status is defined and (_arc_helm_info.status.status|default('')) == 'deployed'}}"
+
+- name: uninstall runner scale sets before upgrade
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{_set.value.ns|default(_gh_arc_runner_ns)}}"
+    name: "{{_set.value.name|default(_set.key)}}"
+    state: absent
+  with_dict: "{{cfg_values.runner_sets|default({})}}"
+  when: >
+    _arc_is_deployed and
+    cfg_values.upgrade|default(false)|bool
+  loop_control:
+    loop_var: _set
+
+- name: uninstall controller before upgrade
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{_gh_arc_system_ns}}"
+    name: "{{cfg_values.arc_name|default('arc')}}"
+    state: absent
+  when: >
+    _arc_is_deployed and
+    cfg_values.upgrade|default(false)|bool
+
+- name: query actions.github.com CRDs for removal
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+  register: _all_crds
+  when: >
+    _arc_is_deployed and
+    cfg_values.upgrade|default(false)|bool and
+    cfg_values.upgrade_remove_crds|default(false)|bool
+
+- name: remove actions.github.com CRDs
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    definition:
+      apiVersion: apiextensions.k8s.io/v1
+      kind: CustomResourceDefinition
+      metadata:
+        name: "{{item.metadata.name}}"
+  loop: "{{_all_crds.resources | selectattr('metadata.name', 'search', '\\.actions\\.github\\.com$') | list}}"
+  loop_control:
+    label: "{{item.metadata.name}}"
+  when: >
+    _arc_is_deployed and
+    cfg_values.upgrade|default(false)|bool and
+    cfg_values.upgrade_remove_crds|default(false)|bool
 
 - name: deploy controller
   kubernetes.core.helm:
@@ -42,6 +121,9 @@
         value_type: raw
       - value: githubConfigSecret.github_app_private_key="{{lookup(k3s_passdb, cfg_values.app_private_key_passdb, returnall=true)}}"
         value_type: raw
+  when: >
+    not _arc_is_deployed or
+    cfg_values.upgrade|default(false)|bool
 
 - name: push runner scale set value templates
   become: false
@@ -51,7 +133,7 @@
     mode: 0600
     src: github-arc-values.yml.j2
     dest: "{{_gh_arc_debug_path}}/github-arc-values-{{_set.value.name|default(_set.key)}}.yml"
-  with_dict: "{{cfg_values.runner_sets|default('{}')}}"
+  with_dict: "{{cfg_values.runner_sets|default({})}}"
   when: >
     _gh_arc_debug_path is defined and
     _set.value.state|default('present') == 'present'
@@ -66,21 +148,19 @@
     name: "{{_set.value.name|default(_set.key)}}"
     chart_ref: "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set"
     values: "{{ lookup('template', 'github-arc-values.yml.j2') | from_yaml }}"
-  with_dict: "{{cfg_values.runner_sets|default('{}')}}"
+  with_dict: "{{cfg_values.runner_sets|default({})}}"
   when: >
     _set.value.state|default('present') == 'present'
   loop_control:
     loop_var: _set
 
-- name: deploy runner scale sets
+- name: remove runner scale sets
   kubernetes.core.helm:
     kubeconfig: "{{_k3s_kubecfg}}"
     namespace: "{{_set.value.ns|default(_gh_arc_runner_ns)}}"
-    create_namespace: true
     name: "{{_set.value.name|default(_set.key)}}"
-    chart_ref: "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set"
     state: absent
-  with_dict: "{{cfg_values.runner_sets|default('{}')}}"
+  with_dict: "{{cfg_values.runner_sets|default({})}}"
   when: >
     _set.value.state|default('present') == 'absent'
   loop_control:

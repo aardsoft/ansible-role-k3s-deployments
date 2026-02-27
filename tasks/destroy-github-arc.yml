@@ -1,0 +1,41 @@
+- set_fact:
+    _gh_arc_system_ns: "{{cfg_values.system_ns|default('arc-system')}}"
+    _gh_arc_runner_ns: "{{cfg_values.runner_ns|default('arc-runners')}}"
+
+- name: remove runner scale sets
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{_set.value.ns|default(_gh_arc_runner_ns)}}"
+    name: "{{_set.value.name|default(_set.key)}}"
+    state: absent
+  with_dict: "{{cfg_values.runner_sets|default({})}}"
+  loop_control:
+    loop_var: _set
+
+- name: remove controller
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{_gh_arc_system_ns}}"
+    name: "{{cfg_values.arc_name|default('arc')}}"
+    state: absent
+
+- name: remove arc-system namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{_gh_arc_system_ns}}"
+
+- name: remove arc-runners namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{_gh_arc_runner_ns}}"
+  when: _gh_arc_runner_ns != _gh_arc_system_ns
