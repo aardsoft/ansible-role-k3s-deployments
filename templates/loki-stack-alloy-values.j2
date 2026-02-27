@@ -1,0 +1,54 @@
+alloy:
+  configMap:
+    create: true
+    content: |
+      // Match pod log files written by containerd on the host node.
+      // File-based discovery requires no RBAC — Alloy reads directly from the hostPath.
+      local.file_match "pod_logs" {
+        path_targets = [{
+          __path__ = "/var/log/pods/**/*.log",
+          job      = "k3s-pod-logs",
+          cluster  = "{{cfg_values.cluster_label|default('k3s')}}",
+        }]
+      }
+
+      // Source logs from matched files and forward to CRI parser.
+      loki.source.file "pod_logs" {
+        targets    = local.file_match.pod_logs.targets
+        forward_to = [loki.process.cri.receiver]
+      }
+
+      // Parse the CRI (containerd) log line format, then forward to Loki.
+      loki.process "cri" {
+        stage.cri {}
+        forward_to = [loki.write.local.receiver]
+      }
+
+      // Push logs to the Loki instance in the same namespace.
+      loki.write "local" {
+        endpoint {
+          url = "http://loki.{{cfg_values.namespace|default('logging')}}.svc.cluster.local:3100/loki/api/v1/push"
+        }
+      }
+
+controller:
+  # Run as DaemonSet so every node ships its own pod logs.
+  type: daemonset
+  tolerations:
+    - effect: NoSchedule
+      operator: Exists
+
+# Mount the host pod log directory into each Alloy instance.
+extraVolumes:
+  - name: pod-logs
+    hostPath:
+      path: /var/log/pods
+
+extraVolumeMounts:
+  - name: pod-logs
+    mountPath: /var/log/pods
+    readOnly: true
+
+# Config reloading not needed for a static file-match config.
+configReloader:
+  enabled: false

@@ -1,0 +1,61 @@
+- name: remove Alloy
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+    name: alloy
+    state: absent
+
+- name: remove Loki
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+    name: loki
+    state: absent
+
+- name: remove LoadBalancer service for external Loki access
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: loki-external
+        namespace: "{{cfg_values.namespace|default('logging')}}"
+  when: cfg_values.loki_ip is defined
+
+# Helm does not delete PVCs created by StatefulSets on chart removal.
+# Query by label so renamed/removed PVCs are still caught.
+- name: query Loki PVCs
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    kind: PersistentVolumeClaim
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+    label_selectors:
+      - "app.kubernetes.io/instance=loki"
+  register: _loki_pvcs
+
+- name: remove Loki PVCs
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: "{{item.metadata.name}}"
+        namespace: "{{cfg_values.namespace|default('logging')}}"
+  loop: "{{_loki_pvcs.resources}}"
+  loop_control:
+    label: "{{item.metadata.name}}"
+
+- name: remove namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{cfg_values.namespace|default('logging')}}"
+  when: cfg_values.remove_namespace|default(false)

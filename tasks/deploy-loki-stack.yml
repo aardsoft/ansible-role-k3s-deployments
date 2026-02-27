@@ -1,0 +1,100 @@
+# Loki (log storage) + Alloy (collector DaemonSet)
+#
+# Grafana Alloy replaced Promtail as the recommended log collector; Promtail is
+# considered feature-complete and receives no new development.  Alloy is a full
+# observability pipeline (metrics, logs, traces) but can be configured for
+# logs-only with a minimal River config.
+#
+# Compared to victoria this has some advantages:
+#
+# - first-class Grafana datasource integration (LogQL, Explore, dashboards)
+# - large community; Alloy can also collect metrics and traces from the same
+#   DaemonSet
+#
+# It also has some disadvantages:
+#
+# - higher resource footprint than VictoriaLogs + Vector
+# - Loki Helm chart is complex; chart values differ significantly between major
+#   versions
+# - log extraction for bulk export (e.g., LLM analysis) is less ergonomic than
+#   VictoriaLogs' HTTP query API; requires logcli or Grafana HTTP API
+# - Loki's filesystem-backed single-binary mode is not recommended for production
+#   multi-replica setups (fine for single-node k3s)
+#
+# cfg_values keys:
+#   namespace:          Kubernetes namespace              (default: logging)
+#   storage_class:      PVC storage class                (default: longhorn)
+#   loki_storage_size:  Loki PVC size                    (default: 10Gi)
+#   loki_retention:     Retention period in hours/days   (default: 744h)
+#   loki_ip:            metallb LoadBalancer IP           (optional)
+#   cluster_label:      Label added to all log streams    (default: k3s)
+#   loki_version:       grafana/loki chart version        (default: latest)
+#   alloy_version:      grafana/alloy chart version       (default: latest)
+#
+# Sample group_vars entry:
+#   k3s:
+#     deployments:
+#       loki-stack:
+#         role: k3s-deployments
+#         name: loki-stack
+#         state: present
+#         config:
+#           namespace: logging
+#           storage_class: longhorn
+#           loki_storage_size: 10Gi
+#           loki_retention: 744h
+#           loki_ip: 192.168.33.130
+#           cluster_label: storage1
+
+- name: deploy Loki
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+    create_namespace: true
+    name: loki
+    chart_ref: loki
+    chart_repo_url: https://grafana.github.io/helm-charts
+    chart_version: "{{cfg_values.loki_version|default(omit)}}"
+    values: "{{lookup('template', 'loki-stack-loki-values.j2') | from_yaml}}"
+
+- name: deploy Alloy
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+    create_namespace: true
+    name: alloy
+    chart_ref: alloy
+    chart_repo_url: https://grafana.github.io/helm-charts
+    chart_version: "{{cfg_values.alloy_version|default(omit)}}"
+    values: "{{lookup('template', 'loki-stack-alloy-values.j2') | from_yaml}}"
+
+- name: create LoadBalancer service for external Loki access
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: loki-external
+        namespace: "{{cfg_values.namespace|default('logging')}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        type: LoadBalancer
+        loadBalancerIP: "{{cfg_values.loki_ip | ansible.utils.ipaddr('address')}}"
+        selector:
+          app.kubernetes.io/instance: loki
+          app.kubernetes.io/name: loki
+          app.kubernetes.io/component: single-binary
+        ports:
+          - name: http
+            port: 3100
+            targetPort: 3100
+            protocol: TCP
+  when: cfg_values.loki_ip is defined
