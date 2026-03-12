@@ -21,6 +21,11 @@
 #   config_url:                GitHub config URL                 (required)
 #   app_private_key_passdb:    passdb path for GitHub App key    (required)
 #   runner_sets:               dict of runner set configs        (required)
+#     runner_scale_set_name:   GitHub runner label for job routing (optional)
+#                              defaults to the runner set key (Helm release name);
+#                              use this to decouple the k8s resource name from
+#                              the GitHub label (e.g. assign a "default" alias
+#                              that can be moved to a newer runner set later)
 
 - fail:
     msg: "cfg_values variable is undefined"

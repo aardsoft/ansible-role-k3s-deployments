@@ -65,6 +65,14 @@ minRunners: {{_set.value.min_runners|default(0)}}
 
 runnerGroup: "{{_set.value.runner_group|default('default')}}"
 
+## runnerScaleSetName sets the GitHub runner label used for job routing.
+## Defaults to the Helm release name (the runner set key in runner_sets).
+## Set this to decouple the k8s resource name from the GitHub label, e.g.
+## to have opensuse-leap156-imgbuild serve as the opensuse-leap-imgbuild default.
+{% if _set.value.runner_scale_set_name is defined %}
+runnerScaleSetName: "{{_set.value.runner_scale_set_name}}"
+{% endif %}
+
 ## name of the runner scale set to create.  Defaults to the helm release name
 # runnerScaleSetName: ""
 
