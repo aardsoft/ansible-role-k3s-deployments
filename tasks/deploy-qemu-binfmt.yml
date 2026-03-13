@@ -1,0 +1,57 @@
+# Deploy a DaemonSet that registers QEMU binfmt_misc handlers on every node,
+# enabling cross-architecture container builds (e.g. aarch64 on amd64 hosts).
+#
+# The privileged initContainer mounts binfmt_misc internally and registers
+# QEMU handlers. Since binfmt_misc is a global kernel subsystem (not
+# per-namespace), registration via a privileged container affects the whole
+# node and is visible to all containers including build runners.
+# The F (fix-binary) flag keeps the QEMU interpreter open across chroot
+# boundaries, which is required for kiwi-ng cross-arch builds.
+#
+# cfg_values keys:
+#   namespace:     Namespace for the DaemonSet  (default: kube-system)
+#   image:         QEMU static image            (default: multiarch/qemu-user-static)
+#   image_tag:     Image tag                    (default: latest)
+#   node_selector: Optional node selector dict  (default: {})
+
+- set_fact:
+    _qemu_binfmt_ns: "{{cfg_values.namespace|default('kube-system')}}"
+    _qemu_binfmt_image: "{{cfg_values.image|default('multiarch/qemu-user-static')}}:{{cfg_values.image_tag|default('latest')}}"
+
+- name: deploy qemu-user-static DaemonSet
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: qemu-user-static
+        namespace: "{{_qemu_binfmt_ns}}"
+        labels:
+          app: qemu-user-static
+          configurator: ansible
+      spec:
+        selector:
+          matchLabels:
+            app: qemu-user-static
+        updateStrategy:
+          type: RollingUpdate
+        template:
+          metadata:
+            labels:
+              app: qemu-user-static
+          spec:
+            tolerations:
+            - operator: Exists
+            nodeSelector: "{{cfg_values.node_selector|default({})}}"
+            containers:
+            - name: binfmt-register
+              image: "{{_qemu_binfmt_image}}"
+              command: ["/bin/sh", "-c", "/register --reset -p yes && sleep infinity"]
+              securityContext:
+                privileged: true
+              resources:
+                limits:
+                  cpu: 10m
+                  memory: 16Mi
