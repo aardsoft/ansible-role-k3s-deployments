@@ -1,0 +1,36 @@
+---
+server:
+  address: 'tcp://0.0.0.0:9091/'
+
+log:
+  level: 'warn'
+
+authentication_backend:
+  password_reset:
+    disable: true
+  file:
+    path: '/config/users_database.yml'
+
+session:
+  cookies:
+    - name: 'authelia_session'
+      domain: '{{cfg_values.cookie_domain|default(cfg_values.hostname)}}'
+      authelia_url: 'https://auth.{{cfg_values.hostname}}'
+      expiration: '12h'
+      inactivity: '1h'
+
+storage:
+  local:
+    path: '/config/data/db.sqlite3'
+
+notifier:
+  filesystem:
+    filename: '/config/data/notification.txt'
+
+access_control:
+  default_policy: 'deny'
+  rules:
+    - domain: '{{cfg_values.hostname}}'
+      policy: 'one_factor'
+    - domain: '*.{{cfg_values.cookie_domain|default(cfg_values.hostname)}}'
+      policy: 'one_factor'

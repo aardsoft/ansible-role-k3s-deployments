@@ -1,0 +1,11 @@
+config:
+  namespaceSelector:
+    matchNames: []
+{% if cfg_values.image_registry is defined %}
+image:
+  repository: "{{cfg_values.image_registry}}/stakater/forecastle"
+{% endif %}
+
+# Ingress is managed separately to attach the auth middleware
+ingress:
+  enabled: false

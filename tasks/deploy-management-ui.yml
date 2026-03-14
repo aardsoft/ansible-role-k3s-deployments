@@ -1,0 +1,403 @@
+# Unified management UI for the k3s cluster.
+#
+# - Deploys Authelia for SSO across all management subdomains
+# - Creates a ForwardAuth Traefik middleware (one per namespace that uses it)
+# - Deploys Forecastle, which auto-discovers services from Ingress annotations
+#
+# This is a bit of a weird mix - it's highly recommended to deploy that in a
+# cluster, yet still optional. So it sits somewhere between being part of the
+# k3s role, and belonging in deployments - for now it goes to deployments.
+#
+# Also, tying authelia into just the management interface also might not be
+# ideal.
+#
+# Traefik entry point IPs are configured under k3s.traefik.entrypoints for
+# the cluster, and applied via the traefik-ansible-label.j2 server manifest
+# template - that step needs to be in the main configuration for this UI setup
+# to work.
+#
+# Forecastle discovers services automatically: any Ingress resource in any
+# namespace that carries the forecastle.stakater.com/expose: "true" annotation
+# will appear in the landing page.
+#
+# Required annotations for a service to appear in Forecastle:
+#   forecastle.stakater.com/expose: "true"
+#   forecastle.stakater.com/appName: "My Service"
+# Optional:
+#   forecastle.stakater.com/group: "Category"
+#
+# Auth is mandatory for all management-facing ingresses. Every ingress on
+# the management entrypoint must carry this annotation:
+#
+#   traefik.ingress.kubernetes.io/router.middlewares: "{namespace}-management-auth@kubernetescrd"
+#
+# The middleware must be in the same namespace as the Ingress — Traefik does not
+# resolve cross-namespace middleware references from Kubernetes Ingress annotations.
+# This deployment creates the ForwardAuth middleware in kube-system and the
+# management namespace. Other service deployments must create their own local
+# copy (same name, pointing to the same forward-auth service).
+# If the middleware does not exist (management-ui not deployed), Traefik will
+# reject all requests to those routes — this is the intended fail-secure behaviour.
+#
+# SSO works via a session cookie scoped to .{cookie_domain}: login once at
+# auth.{hostname} and all subdomains under {cookie_domain} are covered.
+#
+# cfg_values keys:
+#   entrypoint:                Traefik entry point name from k3s.traefik.entrypoints (required)
+#   hostname:                  DNS hostname for Forecastle landing page               (required)
+#   auth_passdb:               passdb path for plaintext password                     (required)
+#                              Store plaintext password; deployment generates htpasswd format.
+#   auth_user:                 Username for auth                          (default: admin)
+#   cookie_domain:             Domain for SSO cookie scope                (default: hostname)
+#   namespace:                 Namespace for Forecastle + forward-auth    (default: management)
+#   management_namespace:      Override for the namespace holding the     (default: namespace)
+#                              forward-auth service (used by other deployments)
+#   forecastle_version:        Helm chart version                         (default: latest)
+#   chart_repo:                Forecastle Helm repo URL                   (default: stakater upstream)
+#   image_registry:            Registry prefix for air-gapped deployments (optional)
+#
+# Sample k3s cluster config:
+#   k3s:
+#     traefik:
+#       entrypoints:
+#         management:
+#           ip: 172.31.255.20
+#     deployments:
+#       management-ui:
+#         state: present
+#         config:
+#           entrypoint: management
+#           hostname: k3s.mgmt.example.com
+#           cookie_domain: k3s.mgmt.example.com
+#           auth_passdb: k3s/management-auth
+
+- name: create management namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+
+- name: load auth password from passdb
+  ansible.builtin.set_fact:
+    _management_auth_passdb: "{{lookup(k3s_passdb, cfg_values.auth_passdb)}}"
+
+- name: assert auth password is non-empty
+  ansible.builtin.assert:
+    that: _management_auth_passdb | length > 0
+    fail_msg: >
+      Passdb lookup for '{{cfg_values.auth_passdb}}' returned empty content.
+      Cannot create management-auth — aborting to prevent open access.
+
+- name: derive authelia secrets and password hash from passdb
+  ansible.builtin.set_fact:
+    _authelia_session_secret: "{{(_management_auth_passdb + 'session') | hash('sha256')}}"
+    _authelia_storage_key: "{{(_management_auth_passdb + 'storage') | hash('sha256')}}"
+    _authelia_user_hash: "{{_management_auth_passdb | password_hash('sha512_crypt', 65534 | random(seed=cfg_values.hostname) | string)}}"
+
+- name: create Authelia ConfigMap
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: authelia
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      data:
+        configuration.yml: "{{lookup('template', 'authelia-config.j2')}}"
+
+- name: create Authelia Secret
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: authelia
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      data:
+        session_secret: "{{_authelia_session_secret | b64encode}}"
+        storage_encryption_key: "{{_authelia_storage_key | b64encode}}"
+        users_database.yml: "{{('---\nusers:\n  ' + cfg_values.auth_user|default('admin') + ':\n    displayname: ' + cfg_values.auth_user|default('admin') + '\n    password: ' + _authelia_user_hash + '\n    email: ' + cfg_values.auth_user|default('admin') + '@' + cfg_values.hostname + '\n    disabled: false\n    groups: []\n') | b64encode}}"
+
+- name: deploy Authelia
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: authelia
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          app: authelia
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: authelia
+        template:
+          metadata:
+            labels:
+              app: authelia
+          spec:
+            enableServiceLinks: false
+            containers:
+              - name: authelia
+                image: "{{cfg_values.image_registry + '/authelia/' if cfg_values.image_registry is defined else ''}}authelia/authelia:{{cfg_values.authelia_version|default('latest')}}"
+                ports:
+                  - containerPort: 9091
+                env:
+                  - name: AUTHELIA_SESSION_SECRET
+                    valueFrom:
+                      secretKeyRef:
+                        name: authelia
+                        key: session_secret
+                  - name: AUTHELIA_STORAGE_ENCRYPTION_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: authelia
+                        key: storage_encryption_key
+                volumeMounts:
+                  - name: config
+                    mountPath: /config/configuration.yml
+                    subPath: configuration.yml
+                  - name: users
+                    mountPath: /config/users_database.yml
+                    subPath: users_database.yml
+                  - name: data
+                    mountPath: /config/data
+            volumes:
+              - name: config
+                configMap:
+                  name: authelia
+              - name: users
+                secret:
+                  secretName: authelia
+                  items:
+                    - key: users_database.yml
+                      path: users_database.yml
+              - name: data
+                emptyDir: {}
+
+- name: create Authelia Service
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: authelia
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        selector:
+          app: authelia
+        ports:
+          - port: 9091
+            targetPort: 9091
+
+- name: check management middlewares for stale basicAuth spec
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: traefik.io/v1alpha1
+    kind: Middleware
+    name: management-auth
+    namespace: "{{item}}"
+  register: _mgmt_mw_check
+  loop:
+    - kube-system
+    - "{{cfg_values.namespace|default('management')}}"
+
+- name: remove management middlewares if basicAuth spec present
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: traefik.io/v1alpha1
+    kind: Middleware
+    name: management-auth
+    namespace: "{{item.item}}"
+  loop: "{{_mgmt_mw_check.results}}"
+  when: >
+    (item.resources | default([]) | length > 0) and
+    (item.resources[0].spec.basicAuth is defined)
+
+- name: create ForwardAuth middleware
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: Middleware
+      metadata:
+        name: management-auth
+        namespace: "{{item}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        forwardAuth:
+          address: "http://authelia.{{cfg_values.namespace|default('management')}}.svc.cluster.local:9091/api/authz/forward-auth"
+          authResponseHeaders:
+            - Remote-User
+            - Remote-Groups
+            - Remote-Name
+            - Remote-Email
+          trustForwardHeader: true
+  loop:
+    - kube-system
+    - "{{cfg_values.namespace|default('management')}}"
+
+- name: deploy Forecastle
+  kubernetes.core.helm:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    namespace: "{{cfg_values.namespace|default('management')}}"
+    create_namespace: true
+    name: forecastle
+    chart_ref: forecastle
+    chart_repo_url: "{{cfg_values.chart_repo|default('https://stakater.github.io/stakater-charts')}}"
+    chart_version: "{{cfg_values.forecastle_version|default(omit)}}"
+    values: "{{lookup('template', 'forecastle-values.j2') | from_yaml}}"
+
+# The Forecastle chart v2 only supports matchNames in its ConfigMap template,
+# not the any: true field from the app's config struct. Patch directly.
+# force: yes takes ownership of data.config.yaml from Helm's field manager.
+- name: patch Forecastle ConfigMap for all-namespace discovery
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    force: yes
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: forecastle
+        namespace: "{{cfg_values.namespace|default('management')}}"
+      data:
+        config.yaml: |
+          namespaceSelector:
+            any: true
+  register: _forecastle_cm_patch
+
+- name: restart Forecastle to pick up ConfigMap changes
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: patched
+    kind: Deployment
+    name: forecastle
+    namespace: "{{cfg_values.namespace|default('management')}}"
+    definition:
+      spec:
+        template:
+          metadata:
+            annotations:
+              kubectl.kubernetes.io/restartedAt: "{{ansible_date_time.iso8601}}"
+  when: _forecastle_cm_patch.changed
+
+# Authelia portal ingress — no auth middleware, this is the auth endpoint
+- name: create Authelia portal Ingress
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: authelia
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          configurator: ansible
+        annotations:
+          traefik.ingress.kubernetes.io/router.entrypoints: "{{cfg_values.entrypoint}},{{cfg_values.entrypoint}}-secure"
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        rules:
+          - host: "auth.{{cfg_values.hostname}}"
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: authelia
+                      port:
+                        number: 9091
+
+- name: create Forecastle Ingress
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: forecastle
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          configurator: ansible
+        annotations:
+          traefik.ingress.kubernetes.io/router.entrypoints: "{{cfg_values.entrypoint}},{{cfg_values.entrypoint}}-secure"
+          traefik.ingress.kubernetes.io/router.middlewares: "{{cfg_values.namespace|default('management')}}-management-auth@kubernetescrd"
+          forecastle.stakater.com/expose: "true"
+          forecastle.stakater.com/appName: "Management Dashboard"
+          forecastle.stakater.com/url: "https://{{cfg_values.hostname}}"
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        rules:
+          - host: "{{cfg_values.hostname}}"
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: forecastle
+                      port:
+                        number: 80
