@@ -351,6 +351,7 @@
           configurator: ansible
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: "{{cfg_values.entrypoint}},{{cfg_values.entrypoint}}-secure"
+          traefik.ingress.kubernetes.io/router.tls: "true"
           ansible.run-id: "{{ansible_run_id|default('N/A')}}"
           ansible.config_file: "{{ansible_config_file|default('N/A')}}"
           ansible.version: "{{ansible_version.full}}"
@@ -382,6 +383,7 @@
           configurator: ansible
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: "{{cfg_values.entrypoint}},{{cfg_values.entrypoint}}-secure"
+          traefik.ingress.kubernetes.io/router.tls: "true"
           traefik.ingress.kubernetes.io/router.middlewares: "{{cfg_values.namespace|default('management')}}-management-auth@kubernetescrd"
           forecastle.stakater.com/expose: "true"
           forecastle.stakater.com/appName: "Management Dashboard"

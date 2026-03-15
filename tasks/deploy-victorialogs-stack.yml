@@ -151,6 +151,7 @@
           configurator: ansible
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: "{{cfg_values.entrypoint|default('management')}},{{cfg_values.entrypoint|default('management')}}-secure"
+          traefik.ingress.kubernetes.io/router.tls: "true"
           traefik.ingress.kubernetes.io/router.middlewares: "{{cfg_values.namespace|default('logging')}}-management-auth@kubernetescrd"
           forecastle.stakater.com/expose: "true"
           forecastle.stakater.com/appName: "VictoriaLogs"
