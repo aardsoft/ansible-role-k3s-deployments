@@ -34,3 +34,59 @@ access_control:
       policy: 'one_factor'
     - domain: '*.{{cfg_values.cookie_domain|default(cfg_values.hostname)}}'
       policy: 'one_factor'
+{% if cfg_values.oidc_clients is defined %}
+
+# OIDC provider — allows external applications to use Authelia for authentication.
+# Requires oidc_jwks_passdb (RSA private key PEM) and oidc_hmac_passdb (32+ char secret)
+# in cfg_values. For k3s API server OIDC integration, add to server_config:
+#   kube-apiserver-arg:
+#     - "oidc-issuer-url=https://auth.{{ cfg_values.hostname }}"
+#     - "oidc-client-id=<client_id>"
+#     - "oidc-username-claim=preferred_username"
+#     - "oidc-groups-claim=groups"
+identity_providers:
+  oidc:
+    hmac_secret: '{{ _authelia_oidc_hmac_secret }}'
+    jwks:
+      - key_id: 'default'
+        algorithm: 'RS256'
+        use: 'sig'
+        key: |
+          {{ _authelia_oidc_jwks_key | indent(10) }}
+    claims_policies:
+      k8s_id_token:
+        id_token:
+          - 'preferred_username'
+          - 'groups'
+          - 'email'
+    clients:
+{% for client in cfg_values.oidc_clients %}
+      - client_id: '{{ client.client_id }}'
+        client_name: '{{ client.client_name | default(client.client_id) }}'
+        client_secret: '{{ lookup(k3s_passdb, client.client_secret_passdb) | password_hash("sha512_crypt") }}'
+        public: false
+        authorization_policy: 'one_factor'
+        consent_mode: '{{ client.consent_mode | default("implicit") }}'
+        claims_policy: '{{ client.claims_policy | default("k8s_id_token") }}'
+        redirect_uris:
+{% for uri in client.redirect_uris %}
+          - '{{ uri }}'
+{% endfor %}
+{% if client.post_logout_redirect_uris is defined %}
+        post_logout_redirect_uris:
+{% for uri in client.post_logout_redirect_uris %}
+          - '{{ uri }}'
+{% endfor %}
+{% endif %}
+        scopes:
+          - 'openid'
+          - 'profile'
+          - 'email'
+          - 'groups'
+        response_types:
+          - 'code'
+        grant_types:
+          - 'authorization_code'
+        userinfo_signed_response_alg: 'none'
+{% endfor %}
+{% endif %}

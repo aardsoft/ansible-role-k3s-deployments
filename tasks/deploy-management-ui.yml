@@ -55,6 +55,15 @@
 #   forecastle_version:        Helm chart version                         (default: latest)
 #   chart_repo:                Forecastle Helm repo URL                   (default: stakater upstream)
 #   image_registry:            Registry prefix for air-gapped deployments (optional)
+#   tls_cert_passdb:           Passdb path for TLS certificate PEM        (optional)
+#   tls_key_passdb:            Passdb path for TLS private key PEM        (optional)
+#                              When set, creates a management-tls Secret and a Traefik TLSStore
+#                              named 'default', making this the cluster-wide default TLS cert.
+#   tls_generate:              Auto-generate a signed server cert if passdb entries are empty
+#     ca_cert_passdb:          Passdb path for signing CA cert            (required)
+#     ca_key_passdb:           Passdb path for signing CA key             (required)
+#     domains:                 List of SANs (DNS names)                   (required)
+#     days:                    Validity in days                           (default: 365)
 #
 # Sample k3s cluster config:
 #   k3s:
@@ -104,10 +113,87 @@
     _authelia_storage_key: "{{(_management_auth_passdb + 'storage') | hash('sha256')}}"
     _authelia_user_hash: "{{_management_auth_passdb | password_hash('sha512_crypt', 65534 | random(seed=cfg_values.hostname) | string)}}"
 
+- name: load Authelia OIDC secrets from passdb
+  ansible.builtin.set_fact:
+    _authelia_oidc_hmac_secret: "{{lookup(k3s_passdb, cfg_values.oidc_hmac_passdb)}}"
+    _authelia_oidc_jwks_key: "{{lookup(k3s_passdb, cfg_values.oidc_jwks_passdb, returnall=true)}}"
+  when: cfg_values.oidc_clients is defined
+
+# Build the user list from cfg_values.users if defined, otherwise fall back to
+# the legacy single-user setup from auth_user/auth_passdb.  Legacy users are
+# always managed (password always synced from passdb).
+- name: build Authelia user list
+  ansible.builtin.set_fact:
+    _authelia_userlist: >-
+      {{
+        cfg_values.users
+        if cfg_values.users is defined
+        else [{
+          'username': cfg_values.auth_user | default('admin'),
+          'passdb': cfg_values.auth_passdb,
+          'email': (cfg_values.auth_user | default('admin')) + '@' + cfg_values.hostname,
+          'groups': [],
+          'managed': true
+        }]
+      }}
+
+# Read the existing Secret so non-managed users can keep their current password
+# hash (set by the user changing their password) rather than being reset to the
+# passdb initial value on every playbook run.
+- name: read existing Authelia Secret
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: Secret
+    name: authelia
+    namespace: "{{cfg_values.namespace|default('management')}}"
+  register: _authelia_secret_info
+
+- name: parse existing Authelia users
+  ansible.builtin.set_fact:
+    _authelia_existing_users: >-
+      {{
+        (_authelia_secret_info.resources[0].data['users_database.yml'] | b64decode | from_yaml).users
+        if (_authelia_secret_info.resources | length > 0 and
+            'users_database.yml' in (_authelia_secret_info.resources[0].data | default({})))
+        else {}
+      }}
+
+- name: reset resolved users fact
+  ansible.builtin.set_fact:
+    _authelia_users_resolved: {}
+
+# For each user: if managed=true or not yet in the existing Secret, generate a
+# fresh hash from passdb (deterministic salt keyed to username so the hash is
+# stable across runs when the passdb value hasn't changed).
+# If managed=false (default) and the user already exists, carry their stored
+# hash forward unchanged.
+- name: resolve Authelia user passwords
+  ansible.builtin.set_fact:
+    _authelia_users_resolved: >-
+      {{
+        _authelia_users_resolved | combine({
+          item.username: {
+            'displayname': item.displayname | default(item.username),
+            'password': (
+              lookup(k3s_passdb, item.passdb) | password_hash('sha512_crypt', 65534 | random(seed=item.username) | string)
+              if (item.managed | default(false) or item.username not in _authelia_existing_users)
+              else _authelia_existing_users[item.username].password
+            ),
+            'email': item.email | default(item.username + '@' + cfg_values.hostname),
+            'disabled': item.disabled | default(false),
+            'groups': item.groups | default([])
+          }
+        })
+      }}
+  loop: "{{_authelia_userlist}}"
+  no_log: true
+
 - name: create Authelia ConfigMap
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
+    apply: yes
     definition:
       apiVersion: v1
       kind: ConfigMap
@@ -122,11 +208,13 @@
           ansible.version: "{{ansible_version.full}}"
       data:
         configuration.yml: "{{lookup('template', 'authelia-config.j2')}}"
+  register: _authelia_configmap
 
 - name: create Authelia Secret
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
+    apply: yes
     definition:
       apiVersion: v1
       kind: Secret
@@ -142,7 +230,25 @@
       data:
         session_secret: "{{_authelia_session_secret | b64encode}}"
         storage_encryption_key: "{{_authelia_storage_key | b64encode}}"
-        users_database.yml: "{{('---\nusers:\n  ' + cfg_values.auth_user|default('admin') + ':\n    displayname: ' + cfg_values.auth_user|default('admin') + '\n    password: ' + _authelia_user_hash + '\n    email: ' + cfg_values.auth_user|default('admin') + '@' + cfg_values.hostname + '\n    disabled: false\n    groups: []\n') | b64encode}}"
+        users_database.yml: "{{lookup('template', 'authelia-users.j2') | b64encode}}"
+  register: _authelia_secret
+
+# Authelia hot-reloads users_database.yml from the mounted Secret volume automatically.
+# A restart is only needed when the ConfigMap (main config) changes.
+- name: restart Authelia to pick up ConfigMap changes
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: patched
+    kind: Deployment
+    name: authelia
+    namespace: "{{cfg_values.namespace|default('management')}}"
+    definition:
+      spec:
+        template:
+          metadata:
+            annotations:
+              kubectl.kubernetes.io/restartedAt: "{{ansible_date_time.iso8601}}"
+  when: _authelia_configmap.changed | default(false)
 
 - name: deploy Authelia
   kubernetes.core.k8s:
@@ -403,3 +509,210 @@
                       name: forecastle
                       port:
                         number: 80
+
+# --- TLS certificate management ---
+# Creates a management-tls Secret and Traefik TLSStore (name: default) so all
+# management hostnames get a proper cert instead of Traefik's self-signed default.
+# If tls_generate is set and the passdb entries are empty, generates a server cert
+# signed by the existing CA (ca_cert_passdb / ca_key_passdb from tls_generate).
+
+- name: check existing TLS cert in passdb
+  ansible.builtin.set_fact:
+    _mgmt_tls_existing: "{{lookup(k3s_passdb, cfg_values.tls_cert_passdb, missing='empty')}}"
+  when: cfg_values.tls_cert_passdb is defined
+  no_log: true
+
+- name: generate signed server certificate
+  when:
+    - cfg_values.tls_cert_passdb is defined
+    - cfg_values.tls_generate is defined
+    - _mgmt_tls_existing == ''
+  block:
+    - name: create temp dir for server cert generation
+      ansible.builtin.tempfile:
+        state: directory
+      register: _mgmt_tls_tmpdir
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_connection: local
+
+    - name: write CA cert to temp dir
+      ansible.builtin.copy:
+        content: "{{lookup(k3s_passdb, cfg_values.tls_generate.ca_cert_passdb, returnall=true)}}"
+        dest: "{{_mgmt_tls_tmpdir.path}}/ca.crt"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      no_log: true
+      vars:
+        ansible_connection: local
+
+    - name: write CA key to temp dir
+      ansible.builtin.copy:
+        content: "{{lookup(k3s_passdb, cfg_values.tls_generate.ca_key_passdb, returnall=true)}}"
+        dest: "{{_mgmt_tls_tmpdir.path}}/ca.key"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      no_log: true
+      vars:
+        ansible_connection: local
+
+    - name: generate server private key
+      ansible.builtin.command:
+        cmd: "openssl genrsa -out {{_mgmt_tls_tmpdir.path}}/server.key 4096"
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      vars:
+        ansible_connection: local
+
+    - name: write SAN config
+      ansible.builtin.copy:
+        dest: "{{_mgmt_tls_tmpdir.path}}/san.cnf"
+        mode: "0600"
+        content: |
+          [req]
+          req_extensions = v3_req
+          distinguished_name = req_distinguished_name
+          [req_distinguished_name]
+          [v3_req]
+          subjectAltName = @alt_names
+          [alt_names]
+          {% for domain in cfg_values.tls_generate.domains %}
+          DNS.{{loop.index}} = {{domain}}
+          {% endfor %}
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_connection: local
+
+    - name: generate CSR
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -new
+          - -key
+          - "{{_mgmt_tls_tmpdir.path}}/server.key"
+          - -out
+          - "{{_mgmt_tls_tmpdir.path}}/server.csr"
+          - -subj
+          - "/CN={{cfg_values.tls_generate.domains | first}}"
+          - -config
+          - "{{_mgmt_tls_tmpdir.path}}/san.cnf"
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      vars:
+        ansible_connection: local
+
+    - name: sign CSR with CA
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -req
+          - -in
+          - "{{_mgmt_tls_tmpdir.path}}/server.csr"
+          - -CA
+          - "{{_mgmt_tls_tmpdir.path}}/ca.crt"
+          - -CAkey
+          - "{{_mgmt_tls_tmpdir.path}}/ca.key"
+          - -CAcreateserial
+          - -out
+          - "{{_mgmt_tls_tmpdir.path}}/server.crt"
+          - -days
+          - "{{cfg_values.tls_generate.days | default(365)}}"
+          - -sha256
+          - -extensions
+          - v3_req
+          - -extfile
+          - "{{_mgmt_tls_tmpdir.path}}/san.cnf"
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      vars:
+        ansible_connection: local
+
+    - name: read generated server cert
+      ansible.builtin.slurp:
+        src: "{{_mgmt_tls_tmpdir.path}}/server.crt"
+      register: _mgmt_tls_cert_b64
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_connection: local
+
+    - name: read generated server key
+      ansible.builtin.slurp:
+        src: "{{_mgmt_tls_tmpdir.path}}/server.key"
+      register: _mgmt_tls_key_b64
+      delegate_to: localhost
+      become: false
+      no_log: true
+      vars:
+        ansible_connection: local
+
+    - name: store server cert in passdb
+      ansible.builtin.set_fact:
+        _dummy: "{{lookup(k3s_passdb, cfg_values.tls_cert_passdb, create=true, userpass=_mgmt_tls_cert_b64.content)}}"
+      no_log: true
+
+    - name: store server key in passdb
+      ansible.builtin.set_fact:
+        _dummy: "{{lookup(k3s_passdb, cfg_values.tls_key_passdb, create=true, userpass=_mgmt_tls_key_b64.content)}}"
+      when: cfg_values.tls_key_passdb is defined
+      no_log: true
+
+    - name: remove server cert generation temp dir
+      ansible.builtin.file:
+        path: "{{_mgmt_tls_tmpdir.path}}"
+        state: absent
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_connection: local
+
+- name: create management-tls Secret
+  no_log: true
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition:
+      apiVersion: v1
+      kind: Secret
+      type: kubernetes.io/tls
+      metadata:
+        name: management-tls
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      data:
+        tls.crt: "{{lookup(k3s_passdb, cfg_values.tls_cert_passdb)}}"
+        tls.key: "{{lookup(k3s_passdb, cfg_values.tls_key_passdb)}}"
+  when: cfg_values.tls_cert_passdb is defined and cfg_values.tls_key_passdb is defined
+
+- name: create Traefik TLSStore default
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: TLSStore
+      metadata:
+        name: default
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      spec:
+        defaultCertificate:
+          secretName: management-tls
+  when: cfg_values.tls_cert_passdb is defined and cfg_values.tls_key_passdb is defined

@@ -1,0 +1,18 @@
+#jinja2: lstrip_blocks: True, trim_blocks: True
+---
+users:
+{% for username, user in _authelia_users_resolved.items() %}
+  {{ username }}:
+    displayname: '{{ user.displayname }}'
+    password: '{{ user.password }}'
+    email: '{{ user.email }}'
+    disabled: {{ 'true' if user.disabled else 'false' }}
+    groups:
+{% if user.groups | length > 0 %}
+{% for group in user.groups %}
+      - '{{ group }}'
+{% endfor %}
+{% else %}
+      []
+{% endif %}
+{% endfor %}
