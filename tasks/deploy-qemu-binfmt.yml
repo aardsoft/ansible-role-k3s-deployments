@@ -18,11 +18,23 @@
     _qemu_binfmt_ns: "{{cfg_values.namespace|default('kube-system')}}"
     _qemu_binfmt_image: "{{cfg_values.image|default('multiarch/qemu-user-static')}}:{{cfg_values.image_tag|default('latest')}}"
 
+- name: get current qemu-user-static DaemonSet
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: apps/v1
+    kind: DaemonSet
+    name: qemu-user-static
+    namespace: "{{_qemu_binfmt_ns}}"
+  register: _current_qemu_ds
+
 - name: deploy qemu-user-static DaemonSet
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
-    definition:
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: apps/v1
       kind: DaemonSet
       metadata:
@@ -59,3 +71,4 @@
                 limits:
                   cpu: 10m
                   memory: 16Mi
+  when: _desired | k3s_content_changed(_current_qemu_ds.resources[0] | default(none))

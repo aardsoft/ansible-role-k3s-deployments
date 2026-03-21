@@ -56,6 +56,33 @@
 #           victorialogs_ip: 192.168.33.130
 #           cluster_label: storage1
 
+- name: get current logging namespace
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    kind: Namespace
+    name: "{{cfg_values.namespace|default('logging')}}"
+  register: _current_logging_ns
+
+- name: create logging namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{cfg_values.namespace|default('logging')}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+  when: _desired | k3s_content_changed(_current_logging_ns.resources[0] | default(none))
+
 - name: add VictoriaMetrics Helm repo
   kubernetes.core.helm_repository:
     name: victoriametrics
@@ -112,11 +139,24 @@
     (_vlogs_mw_check.resources | default([]) | length > 0) and
     (_vlogs_mw_check.resources[0].spec.basicAuth is defined)
 
+- name: get current ForwardAuth middleware for VictoriaLogs
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: traefik.io/v1alpha1
+    kind: Middleware
+    name: management-auth
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+  register: _current_vlogs_mw
+  when: cfg_values.ui_hostname is defined
+
 - name: create ForwardAuth middleware for VictoriaLogs
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
-    definition:
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: traefik.io/v1alpha1
       kind: Middleware
       metadata:
@@ -134,6 +174,18 @@
           authResponseHeaders:
             - X-Forwarded-User
           trustForwardHeader: true
+  when: >
+    cfg_values.ui_hostname is defined and
+    _desired | k3s_content_changed(_current_vlogs_mw.resources[0] | default(none))
+
+- name: get current VictoriaLogs UI ingress
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: networking.k8s.io/v1
+    kind: Ingress
+    name: victorialogs-ui
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+  register: _current_vlogs_ingress
   when: cfg_values.ui_hostname is defined
 
 - name: create VictoriaLogs UI ingress
@@ -141,7 +193,9 @@
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
     apply: yes
-    definition:
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: networking.k8s.io/v1
       kind: Ingress
       metadata:
@@ -172,14 +226,28 @@
                       name: victorialogs-victoria-logs-single-server
                       port:
                         number: 9428
-  when: cfg_values.ui_hostname is defined
+  when: >
+    cfg_values.ui_hostname is defined and
+    _desired | k3s_content_changed(_current_vlogs_ingress.resources[0] | default(none))
+
+- name: get current LoadBalancer service for external VictoriaLogs access
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: Service
+    name: victorialogs-external
+    namespace: "{{cfg_values.namespace|default('logging')}}"
+  register: _current_vlogs_svc
+  when: cfg_values.victorialogs_ip is defined
 
 - name: create LoadBalancer service for external VictoriaLogs access
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
     apply: yes
-    definition:
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: v1
       kind: Service
       metadata:
@@ -202,4 +270,6 @@
             port: 9428
             targetPort: 9428
             protocol: TCP
-  when: cfg_values.victorialogs_ip is defined
+  when: >
+    cfg_values.victorialogs_ip is defined and
+    _desired | k3s_content_changed(_current_vlogs_svc.resources[0] | default(none))

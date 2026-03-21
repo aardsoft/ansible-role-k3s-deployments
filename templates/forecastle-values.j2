@@ -1,6 +1,9 @@
 config:
   namespaceSelector:
     matchNames: []
+
+podLabels:
+  network/cluster-service: "true"
 {% if cfg_values.image_registry is defined %}
 image:
   repository: "{{cfg_values.image_registry}}/stakater/forecastle"

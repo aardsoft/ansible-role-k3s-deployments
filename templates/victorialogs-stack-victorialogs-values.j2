@@ -4,6 +4,9 @@ server:
   image:
     repository: victoriametrics/victoria-logs
 
+  podLabels:
+    network/cluster-service: "true"
+
   # Retention period: accepts suffixes h (hours), d (days), w (weeks), y (years).
   retentionPeriod: {{cfg_values.retention_period|default('30d')}}
 
