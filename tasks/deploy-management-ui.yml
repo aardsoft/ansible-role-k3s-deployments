@@ -189,12 +189,23 @@
   loop: "{{_authelia_userlist}}"
   no_log: true
 
+- name: get current Authelia ConfigMap
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: ConfigMap
+    name: authelia
+    namespace: "{{cfg_values.namespace|default('management')}}"
+  register: _current_authelia_cm
+
 - name: create Authelia ConfigMap
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
     apply: yes
-    definition:
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: v1
       kind: ConfigMap
       metadata:
@@ -209,13 +220,26 @@
       data:
         configuration.yml: "{{lookup('template', 'authelia-config.j2')}}"
   register: _authelia_configmap
+  when: _desired | k3s_content_changed(_current_authelia_cm.resources[0] | default(none))
+
+- name: get current Authelia Secret
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: Secret
+    name: authelia
+    namespace: "{{cfg_values.namespace|default('management')}}"
+  register: _current_authelia_secret
+  no_log: true
 
 - name: create Authelia Secret
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
     apply: yes
-    definition:
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: v1
       kind: Secret
       metadata:
@@ -232,6 +256,8 @@
         storage_encryption_key: "{{_authelia_storage_key | b64encode}}"
         users_database.yml: "{{lookup('template', 'authelia-users.j2') | b64encode}}"
   register: _authelia_secret
+  no_log: true
+  when: _desired | k3s_content_changed(_current_authelia_secret.resources[0] | default(none))
 
 # Authelia hot-reloads users_database.yml from the mounted Secret volume automatically.
 # A restart is only needed when the ConfigMap (main config) changes.
@@ -250,12 +276,23 @@
               kubectl.kubernetes.io/restartedAt: "{{ansible_date_time.iso8601}}"
   when: _authelia_configmap.changed | default(false)
 
+- name: get current Authelia Deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: apps/v1
+    kind: Deployment
+    name: authelia
+    namespace: "{{cfg_values.namespace|default('management')}}"
+  register: _current_authelia_deploy
+
 - name: deploy Authelia
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
     apply: yes
-    definition:
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: apps/v1
       kind: Deployment
       metadata:
@@ -316,12 +353,25 @@
                       path: users_database.yml
               - name: data
                 emptyDir: {}
+  when: _desired | k3s_content_changed(_current_authelia_deploy.resources[0] | default(none))
+
+- name: get current Authelia Service
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: Service
+    name: authelia
+    namespace: "{{cfg_values.namespace|default('management')}}"
+  register: _current_authelia_svc
 
 - name: create Authelia Service
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
-    definition:
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: v1
       kind: Service
       metadata:
@@ -339,6 +389,7 @@
         ports:
           - port: 9091
             targetPort: 9091
+  when: _desired | k3s_content_changed(_current_authelia_svc.resources[0] | default(none))
 
 - name: check management middlewares for stale basicAuth spec
   kubernetes.core.k8s_info:
@@ -428,18 +479,14 @@
 
 - name: restart Forecastle to pick up ConfigMap changes
   kubernetes.core.k8s:
+- name: get current Authelia portal Ingress
+  kubernetes.core.k8s_info:
     kubeconfig: "{{_k3s_kubecfg}}"
-    state: patched
-    kind: Deployment
-    name: forecastle
+    api_version: networking.k8s.io/v1
+    kind: Ingress
+    name: authelia
     namespace: "{{cfg_values.namespace|default('management')}}"
-    definition:
-      spec:
-        template:
-          metadata:
-            annotations:
-              kubectl.kubernetes.io/restartedAt: "{{ansible_date_time.iso8601}}"
-  when: _forecastle_cm_patch.changed
+  register: _current_authelia_ingress
 
 # Authelia portal ingress — no auth middleware, this is the auth endpoint
 - name: create Authelia portal Ingress
