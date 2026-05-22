@@ -80,11 +80,21 @@
 #           cookie_domain: k3s.mgmt.example.com
 #           auth_passdb: k3s/management-auth
 
+- name: get current management namespace
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    kind: Namespace
+    name: "{{cfg_values.namespace|default('management')}}"
+  register: _current_mgmt_ns
+
 - name: create management namespace
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
-    definition:
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: v1
       kind: Namespace
       metadata:
@@ -95,6 +105,7 @@
           ansible.run-id: "{{ansible_run_id|default('N/A')}}"
           ansible.config_file: "{{ansible_config_file|default('N/A')}}"
           ansible.version: "{{ansible_version.full}}"
+  when: _desired | k3s_content_changed(_current_mgmt_ns.resources[0] | default(none))
 
 - name: load auth password from passdb
   ansible.builtin.set_fact:
@@ -314,6 +325,7 @@
           metadata:
             labels:
               app: authelia
+              network/cluster-service: "true"
           spec:
             enableServiceLinks: false
             containers:
@@ -416,11 +428,26 @@
     (item.resources | default([]) | length > 0) and
     (item.resources[0].spec.basicAuth is defined)
 
+- name: get current ForwardAuth middlewares
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: traefik.io/v1alpha1
+    kind: Middleware
+    name: management-auth
+    namespace: "{{item}}"
+  loop:
+    - kube-system
+    - "{{cfg_values.namespace|default('management')}}"
+  register: _current_mgmt_mws
+
 - name: create ForwardAuth middleware
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
-    definition:
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: traefik.io/v1alpha1
       kind: Middleware
       metadata:
@@ -441,44 +468,72 @@
             - Remote-Name
             - Remote-Email
           trustForwardHeader: true
+    _current_mw: >-
+      {{ (_current_mgmt_mws.results
+          | selectattr('item', 'equalto', item)
+          | map(attribute='resources')
+          | first | default([])
+          | first | default(none)) }}
   loop:
     - kube-system
     - "{{cfg_values.namespace|default('management')}}"
+  when: _desired | k3s_content_changed(_current_mw)
 
 - name: deploy Forecastle
-  kubernetes.core.helm:
-    kubeconfig: "{{_k3s_kubecfg}}"
-    namespace: "{{cfg_values.namespace|default('management')}}"
-    create_namespace: true
-    name: forecastle
-    chart_ref: forecastle
-    chart_repo_url: "{{cfg_values.chart_repo|default('https://stakater.github.io/stakater-charts')}}"
-    chart_version: "{{cfg_values.forecastle_version|default(omit)}}"
-    values: "{{lookup('template', 'forecastle-values.j2') | from_yaml}}"
+  block:
+    - name: deploy Forecastle
+      kubernetes.core.helm:
+        kubeconfig: "{{_k3s_kubecfg}}"
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        create_namespace: true
+        name: forecastle
+        chart_ref: forecastle
+        chart_repo_url: "{{cfg_values.chart_repo|default('https://stakater.github.io/stakater-charts')}}"
+        chart_version: "{{cfg_values.forecastle_version|default(omit)}}"
+        values: "{{lookup('template', 'forecastle-values.j2') | from_yaml}}"
+  rescue:
+    - name: abort on forecastle deploy failure
+      ansible.builtin.fail:
+        msg: >
+          Forecastle Helm deploy failed with SSA conflict.
+          The forecastle ConfigMap is owned by a different field manager
+          (likely from an earlier force-patched deploy) and Helm cannot
+          overwrite it.  To auto-heal this on the next run, set:
+            k3s.deployments.management-ui.config.forecastle_auto_heal: true
+          Alternatively, run manually:
+            kubectl delete configmap forecastle -n management
+            helm uninstall forecastle -n management
+            # then re-run the playbook
+      when: cfg_values.forecastle_auto_heal | default(false) | bool == false
 
-# The Forecastle chart v2 only supports matchNames in its ConfigMap template,
-# not the any: true field from the app's config struct. Patch directly.
-# force: yes takes ownership of data.config.yaml from Helm's field manager.
-- name: patch Forecastle ConfigMap for all-namespace discovery
-  kubernetes.core.k8s:
-    kubeconfig: "{{_k3s_kubecfg}}"
-    state: present
-    apply: yes
-    force: yes
-    definition:
-      apiVersion: v1
-      kind: ConfigMap
-      metadata:
+    - name: remove conflicting forecastle ConfigMap
+      kubernetes.core.k8s:
+        kubeconfig: "{{_k3s_kubecfg}}"
+        state: absent
+        api_version: v1
+        kind: ConfigMap
         name: forecastle
         namespace: "{{cfg_values.namespace|default('management')}}"
-      data:
-        config.yaml: |
-          namespaceSelector:
-            any: true
-  register: _forecastle_cm_patch
 
-- name: restart Forecastle to pick up ConfigMap changes
-  kubernetes.core.k8s:
+    - name: uninstall failed forecastle Helm release
+      kubernetes.core.helm:
+        kubeconfig: "{{_k3s_kubecfg}}"
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        name: forecastle
+        state: absent
+      ignore_errors: true
+
+    - name: deploy Forecastle (retry after cleanup)
+      kubernetes.core.helm:
+        kubeconfig: "{{_k3s_kubecfg}}"
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        create_namespace: true
+        name: forecastle
+        chart_ref: forecastle
+        chart_repo_url: "{{cfg_values.chart_repo|default('https://stakater.github.io/stakater-charts')}}"
+        chart_version: "{{cfg_values.forecastle_version|default(omit)}}"
+        values: "{{lookup('template', 'forecastle-values.j2') | from_yaml}}"
+
 - name: get current Authelia portal Ingress
   kubernetes.core.k8s_info:
     kubeconfig: "{{_k3s_kubecfg}}"
@@ -494,7 +549,9 @@
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
     apply: yes
-    definition:
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: networking.k8s.io/v1
       kind: Ingress
       metadata:
@@ -520,13 +577,25 @@
                       name: authelia
                       port:
                         number: 9091
+  when: _desired | k3s_content_changed(_current_authelia_ingress.resources[0] | default(none))
+
+- name: get current Forecastle Ingress
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: networking.k8s.io/v1
+    kind: Ingress
+    name: forecastle
+    namespace: "{{cfg_values.namespace|default('management')}}"
+  register: _current_forecastle_ingress
 
 - name: create Forecastle Ingress
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
     apply: yes
-    definition:
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: networking.k8s.io/v1
       kind: Ingress
       metadata:
@@ -556,6 +625,7 @@
                       name: forecastle
                       port:
                         number: 80
+  when: _desired | k3s_content_changed(_current_forecastle_ingress.resources[0] | default(none))
 
 # --- TLS certificate management ---
 # Creates a management-tls Secret and Traefik TLSStore (name: default) so all
@@ -722,13 +792,25 @@
       vars:
         ansible_connection: local
 
+- name: get current management-tls Secret
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: Secret
+    name: management-tls
+    namespace: "{{cfg_values.namespace|default('management')}}"
+  register: _current_mgmt_tls
+  when: cfg_values.tls_cert_passdb is defined and cfg_values.tls_key_passdb is defined
+
 - name: create management-tls Secret
   no_log: true
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
     apply: yes
-    definition:
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: v1
       kind: Secret
       type: kubernetes.io/tls
@@ -742,6 +824,16 @@
       data:
         tls.crt: "{{lookup(k3s_passdb, cfg_values.tls_cert_passdb)}}"
         tls.key: "{{lookup(k3s_passdb, cfg_values.tls_key_passdb)}}"
+  when: cfg_values.tls_cert_passdb is defined and cfg_values.tls_key_passdb is defined and _desired | k3s_content_changed(_current_mgmt_tls.resources[0] | default(none))
+
+- name: get current Traefik TLSStore default
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: traefik.io/v1alpha1
+    kind: TLSStore
+    name: default
+    namespace: "{{cfg_values.namespace|default('management')}}"
+  register: _current_tlsstore
   when: cfg_values.tls_cert_passdb is defined and cfg_values.tls_key_passdb is defined
 
 - name: create Traefik TLSStore default
@@ -749,7 +841,9 @@
     kubeconfig: "{{_k3s_kubecfg}}"
     state: present
     apply: yes
-    definition:
+    definition: "{{_desired}}"
+  vars:
+    _desired:
       apiVersion: traefik.io/v1alpha1
       kind: TLSStore
       metadata:
@@ -762,4 +856,4 @@
       spec:
         defaultCertificate:
           secretName: management-tls
-  when: cfg_values.tls_cert_passdb is defined and cfg_values.tls_key_passdb is defined
+  when: cfg_values.tls_cert_passdb is defined and cfg_values.tls_key_passdb is defined and _desired | k3s_content_changed(_current_tlsstore.resources[0] | default(none))
