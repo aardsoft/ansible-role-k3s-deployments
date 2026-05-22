@@ -1,0 +1,44 @@
+- name: remove Authelia Ingress
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: networking.k8s.io/v1
+    kind: Ingress
+    name: "{{cfg_values.name|default('authelia')}}"
+    namespace: "{{cfg_values.namespace|default('management')}}"
+
+- name: remove Authelia Deployment
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: apps/v1
+    kind: Deployment
+    name: "{{cfg_values.name|default('authelia')}}"
+    namespace: "{{cfg_values.namespace|default('management')}}"
+
+- name: remove Authelia Service
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: v1
+    kind: Service
+    name: "{{cfg_values.name|default('authelia')}}"
+    namespace: "{{cfg_values.namespace|default('management')}}"
+
+- name: remove Authelia Secret
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: "{{cfg_values.name|default('authelia')}}"
+    namespace: "{{cfg_values.namespace|default('management')}}"
+
+- name: remove Authelia ConfigMap
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: v1
+    kind: ConfigMap
+    name: "{{cfg_values.name|default('authelia')}}"
+    namespace: "{{cfg_values.namespace|default('management')}}"

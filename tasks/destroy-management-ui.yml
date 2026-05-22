@@ -5,6 +5,10 @@
     name: forecastle
     state: absent
 
+# DEPRECATED: authelia cleanup below is kept for backward compatibility during
+# the transition to deploy-authelia.yml.  In the future, destroying management-ui
+# should NOT remove authelia — use destroy-authelia.yml instead.
+
 - name: remove Authelia Ingress
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
