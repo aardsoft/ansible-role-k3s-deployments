@@ -12,41 +12,102 @@
 #   arc_name:                  Helm release name for controller  (default: arc)
 #   system_ns:                 Namespace for controller          (default: arc-system)
 #   runner_ns:                 Namespace for runner sets         (default: arc-runners)
-#   secret_name:               Secret name for GitHub auth       (default: arc-secret)
 #   upgrade:                   Force uninstall+reinstall         (default: false)
 #   upgrade_remove_crds:       Also remove actions.github.com CRDs before reinstall
 #                              Required when CRDs changed between versions (default: false)
-#   app_id:                    GitHub App ID                     (required)
-#   app_installation_id:       GitHub App Installation ID        (required)
-#   config_url:                GitHub config URL                 (required)
-#   app_private_key_passdb:    passdb path for GitHub App key    (required)
+#   chart_version:             Helm chart version for both controller and runner sets
+#                              (default: latest if controller absent, otherwise the
+#                              currently deployed controller version)
 #   runner_sets:               dict of runner set configs        (required)
 #     runner_scale_set_name:   GitHub runner label for job routing (optional)
 #                              defaults to the runner set key (Helm release name);
 #                              use this to decouple the k8s resource name from
 #                              the GitHub label (e.g. assign a "default" alias
 #                              that can be moved to a newer runner set later)
+#     organization:            reference to an entry in cfg_values.organizations (optional)
+#
+# GitHub auth can be configured in three ways (checked in this order per field):
+#   1. Per runner set: _set.value.app_id / config_url / app_installation_id / app_private_key_passdb
+#   2. Named org:      cfg_values.organizations.<name> — reference via runner_set.organization
+#                      or via cfg_values.controller_organization for the controller
+#   3. Top-level defaults (legacy): cfg_values.app_id / config_url / etc.
+#
+# organizations:               named auth blocks (optional)
+#   <name>:
+#     config_url:              GitHub org/repo URL
+#     app_id:                  GitHub App ID
+#     app_installation_id:     GitHub App Installation ID
+#     app_private_key_passdb:  passdb path for GitHub App private key
+# controller_organization:     org name from organizations: to use for the controller (optional)
+#                              ignored if top-level app_id/config_url are present (legacy path)
 
 - fail:
     msg: "cfg_values variable is undefined"
   when: cfg_values is undefined
 
-- fail:
-    msg: "cfg_values.app_id is undefined"
-  when: cfg_values.app_id is undefined
+# Resolve controller auth: top-level fields (legacy) take precedence, then controller_organization
+- set_fact:
+    _gh_arc_ctrl_org: >-
+      {{ (cfg_values.organizations | default({}))[cfg_values.controller_organization]
+         if (cfg_values.controller_organization is defined
+             and cfg_values.controller_organization in (cfg_values.organizations | default({})))
+         else {} }}
+
+- set_fact:
+    _gh_arc_ctrl_config_url:            "{{cfg_values.config_url            | default(_gh_arc_ctrl_org.config_url            | default(''))}}"
+    _gh_arc_ctrl_app_id:                "{{cfg_values.app_id                | default(_gh_arc_ctrl_org.app_id                | default(''))}}"
+    _gh_arc_ctrl_app_installation_id:   "{{cfg_values.app_installation_id   | default(_gh_arc_ctrl_org.app_installation_id   | default(''))}}"
+    _gh_arc_ctrl_app_private_key_passdb: "{{cfg_values.app_private_key_passdb | default(_gh_arc_ctrl_org.app_private_key_passdb | default(''))}}"
 
 - fail:
-    msg: "cfg_values.app_installation_id is undefined"
-  when: cfg_values.app_installation_id is undefined
+    msg: "Controller auth missing: set cfg_values.app_id or cfg_values.controller_organization referencing an entry in cfg_values.organizations"
+  when: _gh_arc_ctrl_app_id == ''
 
 - fail:
-    msg: "cfg_values.config_url is undefined"
-  when: cfg_values.config_url is undefined
+    msg: "Controller auth missing: set cfg_values.app_installation_id or controller_organization.app_installation_id"
+  when: _gh_arc_ctrl_app_installation_id == ''
+
+- fail:
+    msg: "Controller auth missing: set cfg_values.config_url or controller_organization.config_url"
+  when: _gh_arc_ctrl_config_url == ''
 
 - set_fact:
     _gh_arc_system_ns: "{{cfg_values.system_ns|default('arc-system')}}"
     _gh_arc_runner_ns: "{{cfg_values.runner_ns|default('arc-runners')}}"
-    _gh_arc_secret_name: "{{cfg_values.secret_name|default('arc-secret')}}"
+
+- name: get current arc namespaces
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    kind: Namespace
+    name: "{{item}}"
+  loop:
+    - "{{_gh_arc_system_ns}}"
+    - "{{_gh_arc_runner_ns}}"
+  register: _current_arc_namespaces
+
+- name: create arc namespaces
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{item.item}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+    _current_ns: "{{(item.resources | default([]))[0] | default(none)}}"
+  loop: "{{_current_arc_namespaces.results}}"
+  loop_control:
+    label: "{{item.item}}"
+  when: _desired | k3s_content_changed(_current_ns)
 
 - name: check if controller is already deployed
   kubernetes.core.helm_info:
@@ -58,6 +119,16 @@
 
 - set_fact:
     _arc_is_deployed: "{{_arc_helm_info.status is defined and (_arc_helm_info.status.status|default('')) == 'deployed'}}"
+
+- set_fact:
+    _gh_arc_ctrl_chart_version: >-
+      {{
+        (_arc_helm_info.status.chart | default(''))
+        | regex_replace('^gha-runner-scale-set-controller-', '')
+      }}
+  when:
+    - _arc_is_deployed
+    - _arc_helm_info.status.chart is defined
 
 - name: uninstall runner scale sets before upgrade
   kubernetes.core.helm:
@@ -117,18 +188,39 @@
     create_namespace: true
     name: "{{cfg_values.arc_name|default('arc')}}"
     chart_ref: "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller"
+    chart_version: "{{cfg_values.chart_version|default(omit)}}"
     set_values:
-      - value: githubConfigUrl="{{cfg_values.config_url}}"
+      - value: githubConfigUrl="{{_gh_arc_ctrl_config_url}}"
         value_type: raw
-      - value: githubConfigSecret.github_app_id="{{cfg_values.app_id}}"
+      - value: githubConfigSecret.github_app_id="{{_gh_arc_ctrl_app_id}}"
         value_type: raw
-      - value: githubConfigSecret.github_app_installation_id="{{cfg_values.app_installation_id}}"
+      - value: githubConfigSecret.github_app_installation_id="{{_gh_arc_ctrl_app_installation_id}}"
         value_type: raw
-      - value: githubConfigSecret.github_app_private_key="{{lookup(k3s_passdb, cfg_values.app_private_key_passdb, returnall=true)}}"
+      - value: githubConfigSecret.github_app_private_key="{{lookup(k3s_passdb, _gh_arc_ctrl_app_private_key_passdb, returnall=true)}}"
         value_type: raw
   when: >
     not _arc_is_deployed or
     cfg_values.upgrade|default(false)|bool
+
+- name: refresh controller chart version after deploy
+  kubernetes.core.helm_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    name: "{{cfg_values.arc_name|default('arc')}}"
+    release_namespace: "{{_gh_arc_system_ns}}"
+  register: _arc_helm_info_updated
+  when: not _arc_is_deployed or cfg_values.upgrade|default(false)|bool
+  failed_when: false
+
+- set_fact:
+    _gh_arc_ctrl_chart_version: >-
+      {{
+        (_arc_helm_info_updated.status.chart | default(''))
+        | regex_replace('^gha-runner-scale-set-controller-', '')
+      }}
+  when:
+    - _arc_helm_info_updated is defined
+    - _arc_helm_info_updated.status is defined
+    - _arc_helm_info_updated.status.chart is defined
 
 - name: push runner scale set value templates
   become: false
@@ -138,6 +230,7 @@
     mode: 0600
     src: github-arc-values.yml.j2
     dest: "{{_gh_arc_debug_path}}/github-arc-values-{{_set.value.name|default(_set.key)}}.yml"
+  changed_when: false
   with_dict: "{{cfg_values.runner_sets|default({})}}"
   when: >
     _gh_arc_debug_path is defined and
@@ -152,6 +245,7 @@
     create_namespace: true
     name: "{{_set.value.name|default(_set.key)}}"
     chart_ref: "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set"
+    chart_version: "{{cfg_values.chart_version|default(_gh_arc_ctrl_chart_version|default(omit))}}"
     values: "{{ lookup('template', 'github-arc-values.yml.j2') | from_yaml }}"
   with_dict: "{{cfg_values.runner_sets|default({})}}"
   when: >

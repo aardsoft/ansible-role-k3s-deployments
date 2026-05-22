@@ -1,6 +1,11 @@
 ## githubConfigUrl is the GitHub url for where you want to configure runners
 ## ex: https://github.com/myorg/myrepo or https://github.com/myorg
-githubConfigUrl: "{{_set.value.config_url|default(cfg_values.config_url)}}"
+{# Resolve org block: per-set 'organization:' key -> cfg_values.organizations entry, or {} #}
+{% set _org = (cfg_values.organizations | default({}))[_set.value.organization]
+              if (_set.value.organization is defined
+                  and _set.value.organization in (cfg_values.organizations | default({})))
+              else {} %}
+githubConfigUrl: "{{_set.value.config_url | default(_org.config_url | default(cfg_values.config_url | default('')))}}"
 
 ## githubConfigSecret is the k8s secret information to use when authenticating via the GitHub API.
 ## You can choose to supply:
@@ -28,10 +33,10 @@ githubConfigUrl: "{{_set.value.config_url|default(cfg_values.config_url)}}"
 #      private key line N
 #
 githubConfigSecret:
-  github_app_id: "{{_set.value.app_id|default(cfg_values.app_id)}}"
-  github_app_installation_id: "{{_set.value.app_installation_id|default(cfg_values.app_installation_id)}}"
+  github_app_id: "{{_set.value.app_id | default(_org.app_id | default(cfg_values.app_id | default('')))}}"
+  github_app_installation_id: "{{_set.value.app_installation_id | default(_org.app_installation_id | default(cfg_values.app_installation_id | default('')))}}"
   github_app_private_key: |-
-    {{lookup(k3s_passdb, _set.value.app_private_key_passdb|default(cfg_values.app_private_key_passdb), returnall=true)|indent(4)}}
+    {{lookup(k3s_passdb, _set.value.app_private_key_passdb | default(_org.app_private_key_passdb | default(cfg_values.app_private_key_passdb)), returnall=true)|indent(4)}}
 ## (Variation C) When using a pre-defined Kubernetes secret in the same namespace that the gha-runner-scale-set is going to deploy,
 ## the syntax is as follows:
 # githubConfigSecret: pre-defined-secret
@@ -285,10 +290,9 @@ runnerScaleSetName: "{{_set.value.runner_scale_set_name}}"
 ## template is the PodSpec for each runner Pod
 ## For reference: https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#PodSpec
 
-{% if _set.value.template is defined %}
+{% set _runner_template = {'metadata': {'labels': {'network/dmz': 'true'}}} | combine(_set.value.template | default({}), recursive=True) %}
 template:
-  {{ _set.value.template | to_nice_yaml(indent=2, width=9999)|indent(2) }}
-{% endif %}
+  {{ _runner_template | to_nice_yaml(indent=2, width=9999) | indent(2) }}
 
   ## template.spec will be modified if you change the container mode
   ## with containerMode.type=dind, we will populate the template.spec with following pod spec
