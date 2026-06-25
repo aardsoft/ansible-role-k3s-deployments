@@ -1,0 +1,909 @@
+# Deploy Headlamp Kubernetes dashboard in two instances:
+#
+# 1. Admin instance — read-only + pod delete, protected by Authelia ForwardAuth.
+#    Runs with a dedicated ServiceAccount bound to a ClusterRole that allows
+#    get/list/watch on all resources and delete on pods. Accessible via the
+#    management entrypoint and discoverable via Forecastle.
+#
+# 2. User instance — for tenant self-service. Runs with a minimal ServiceAccount
+#    (no cluster permissions). Users authenticate either via their own k8s tokens
+#    (default) or via OIDC (when oidc_client_secret_passdb is set). In token mode,
+#    users obtain their token via kubectl and paste it into the Headlamp login page.
+#    In OIDC mode, users log in directly via Authelia (or an external IdP).
+#
+# OIDC prerequisites (user instance):
+#   - management-ui must have oidc_clients configured with a matching client entry
+#     (oidc_hmac_passdb and oidc_jwks_passdb also required there)
+#   - k3s server_config must include kube-apiserver-arg for oidc-issuer-url,
+#     oidc-client-id, oidc-username-claim (preferred_username), oidc-groups-claim
+#   - The OIDC client secret must exist in passdb at oidc_client_secret_passdb
+#
+# Namespace filtering for users:
+#   Headlamp has no server-side per-user namespace filtering. The "Allowed
+#   Namespaces" setting in Headlamp's cluster settings UI (Settings -> Cluster)
+#   is stored in browser localStorage and must be configured manually per
+#   browser session. Users with limited RBAC should set this to their assigned
+#   namespace(s) so Headlamp makes targeted per-namespace API calls instead of
+#   flooding the API with cluster-wide list requests that return 403.
+#   k8s RBAC remains the actual enforcement boundary regardless of this setting.
+#
+# Customer SSO (user instance):
+#   Set oidc_issuer_url to the external IdP's issuer URL instead of Authelia.
+#   The external IdP must still be listed as a trusted issuer in the k8s API
+#   server config. Authelia OIDC config is not required in this case.
+#
+# cfg_values keys:
+#   namespace:                  Deployment namespace              (default: headlamp)
+#   admin_hostname:             Admin instance hostname           (required)
+#   admin_entrypoint:           Traefik entrypoint for admin      (required)
+#   management_namespace:       Namespace with ForwardAuth mw     (default: management)
+#   user_hostname:              User instance hostname            (required)
+#   user_entrypoint:            Traefik entrypoint for users      (required)
+#   headlamp_version:           Image tag                         (default: latest)
+#   image_registry:             Registry prefix for air-gapped    (optional)
+#   oidc_client_id:             OIDC client ID                    (default: headlamp-users)
+#   oidc_client_secret_passdb:  Passdb path for OIDC secret       (enables OIDC when set)
+#   oidc_issuer_url:            External OIDC issuer override     (optional)
+#   management_hostname:        Authelia hostname                 (required for OIDC without oidc_issuer_url)
+#   admin_config_storage:           PVC for admin plugin/config dir   (optional; emptyDir if absent)
+#     storage_class:                StorageClass name                 (required if admin_config_storage set)
+#     size:                         PVC size                          (default: 500Mi)
+#   user_config_storage:            PVC for user plugin/config dir    (optional; emptyDir if absent)
+#     storage_class:                StorageClass name                 (required if user_config_storage set)
+#     size:                         PVC size                          (default: 500Mi)
+#   admin_oidc_client_secret_passdb: Passdb path for admin OIDC secret (enables admin OIDC when set)
+#   admin_oidc_client_id:           OIDC client ID for admin instance (default: headlamp-admin)
+#   admin_oidc_group:               OIDC group bound to headlamp-admin ClusterRole
+#                                   (default: k3s-admins; only used when admin OIDC enabled)
+#   oidc_ca_passdb:                 Passdb path for CA cert for OIDC TLS verification (optional)
+#                                   The CA cert is stored as a Secret in the headlamp namespace
+#                                   and mounted at /etc/ssl/headlamp-ca/ca.crt; SSL_CERT_FILE is
+#                                   set so Go TLS trusts the OIDC issuer's certificate.
+#
+# Sample cluster config:
+#   k3s:
+#     deployments:
+#       headlamp:
+#         state: present
+#         config:
+#           namespace: headlamp
+#           admin_hostname: admin-dash.k3s.mgmt.example.com
+#           admin_entrypoint: management
+#           management_namespace: management
+#           user_hostname: dashboard.example.com
+#           user_entrypoint: web
+
+- name: set headlamp namespace fact
+  ansible.builtin.set_fact:
+    _headlamp_ns: "{{cfg_values.namespace|default('headlamp')}}"
+    _headlamp_image: >-
+      {{cfg_values.image_registry + '/' if cfg_values.image_registry is defined else 'ghcr.io/'}}headlamp-k8s/headlamp:{{cfg_values.headlamp_version|default('latest')}}
+    _headlamp_mgmt_ns: "{{cfg_values.management_namespace|default('management')}}"
+
+- name: get current headlamp namespace
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    kind: Namespace
+    name: "{{_headlamp_ns}}"
+  register: _current_headlamp_ns
+
+- name: create headlamp namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+  when: _desired | k3s_content_changed(_current_headlamp_ns.resources[0] | default(none))
+- name: get current headlamp-admin config PVC
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: headlamp-admin-config
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_admin_pvc
+  when: cfg_values.admin_config_storage is defined
+
+- name: create headlamp-admin config PVC
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: headlamp-admin-config
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: "{{cfg_values.admin_config_storage.storage_class}}"
+        resources:
+          requests:
+            storage: "{{cfg_values.admin_config_storage.size|default('500Mi')}}"
+  when: cfg_values.admin_config_storage is defined and _desired | k3s_content_changed(_current_headlamp_admin_pvc.resources[0] | default(none))
+
+- name: get current headlamp-user config PVC
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: headlamp-user-config
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_user_pvc
+  when: cfg_values.user_config_storage is defined
+
+- name: create headlamp-user config PVC
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: headlamp-user-config
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: "{{cfg_values.user_config_storage.storage_class}}"
+        resources:
+          requests:
+            storage: "{{cfg_values.user_config_storage.size|default('500Mi')}}"
+  when: cfg_values.user_config_storage is defined and _desired | k3s_content_changed(_current_headlamp_user_pvc.resources[0] | default(none))
+
+- name: build oidc group-channel pairs from user_namespaces
+  ansible.builtin.set_fact:
+    _headlamp_group_channels_list: >-
+      {{ _headlamp_group_channels_list | default([])
+         + (item.value.groups | default([])
+            | map('regex_replace', '$', '=' + item.key) | list) }}
+  loop: "{{ (_k3s_cfg.user_namespaces | default({})) | dict2items }}"
+  when: cfg_values.oidc_group_channels is not defined
+
+- name: resolve oidc group channels
+  ansible.builtin.set_fact:
+    _headlamp_oidc_group_channels: >-
+      {{ cfg_values.oidc_group_channels
+         | default(_headlamp_group_channels_list | default([]) | join(',')) }}
+
+- name: resolve CA cert config
+  ansible.builtin.set_fact:
+    _headlamp_oidc_ca_enabled: "{{cfg_values.oidc_ca_passdb is defined}}"
+
+- name: get current headlamp-oidc-ca Secret
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: Secret
+    name: headlamp-oidc-ca
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_oidc_ca
+  when: _headlamp_oidc_ca_enabled
+
+- name: create headlamp-oidc-ca Secret in headlamp namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: headlamp-oidc-ca
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      data:
+        ca.crt: "{{(lookup(k3s_passdb, cfg_values.oidc_ca_passdb, returnall=true).split('\nlookup_pass:')[0] + '\n') | b64encode}}"
+  when: _headlamp_oidc_ca_enabled and _desired | k3s_content_changed(_current_headlamp_oidc_ca.resources[0] | default(none))
+
+- name: resolve admin OIDC config
+  ansible.builtin.set_fact:
+    _headlamp_admin_oidc_enabled: "{{cfg_values.admin_oidc_client_secret_passdb is defined}}"
+    _headlamp_admin_oidc_client_id: "{{cfg_values.admin_oidc_client_id|default('headlamp-admin')}}"
+    _headlamp_admin_oidc_issuer: >-
+      {{cfg_values.oidc_issuer_url
+        | default('https://auth.' + (cfg_values.management_hostname | default(cfg_values.admin_hostname)))}}
+
+- name: load admin OIDC client secret from passdb
+  ansible.builtin.set_fact:
+    _headlamp_admin_oidc_secret: "{{lookup(k3s_passdb, cfg_values.admin_oidc_client_secret_passdb)}}"
+  when: _headlamp_admin_oidc_enabled
+
+- name: get current headlamp-admin OIDC Secret
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: Secret
+    name: headlamp-admin-oidc
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_admin_oidc
+  when: _headlamp_admin_oidc_enabled
+
+- name: create headlamp-admin OIDC Secret
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: headlamp-admin-oidc
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      data:
+        client-secret: "{{_headlamp_admin_oidc_secret | b64encode}}"
+  when: _headlamp_admin_oidc_enabled and _desired | k3s_content_changed(_current_headlamp_admin_oidc.resources[0] | default(none))
+
+- name: set headlamp config volume facts
+  ansible.builtin.set_fact:
+    _headlamp_admin_config_vol: >-
+      {{
+        {'name': 'headlamp-config', 'persistentVolumeClaim': {'claimName': 'headlamp-admin-config'}}
+        if cfg_values.admin_config_storage is defined
+        else {'name': 'headlamp-config', 'emptyDir': {}}
+      }}
+    _headlamp_user_config_vol: >-
+      {{
+        {'name': 'headlamp-config', 'persistentVolumeClaim': {'claimName': 'headlamp-user-config'}}
+        if cfg_values.user_config_storage is defined
+        else {'name': 'headlamp-config', 'emptyDir': {}}
+      }}
+    _headlamp_ca_extra_volumes: >-
+      {{
+        [{'name': 'oidc-ca', 'secret': {'secretName': 'headlamp-oidc-ca'}}]
+        if _headlamp_oidc_ca_enabled
+        else []
+      }}
+    _headlamp_ca_extra_mounts: >-
+      {{
+        [{'name': 'oidc-ca', 'mountPath': '/etc/ssl/headlamp-ca', 'readOnly': true}]
+        if _headlamp_oidc_ca_enabled
+        else []
+      }}
+    _headlamp_ca_extra_env: >-
+      {{
+        [{'name': 'SSL_CERT_FILE', 'value': '/etc/ssl/headlamp-ca/ca.crt'}]
+        if _headlamp_oidc_ca_enabled
+        else []
+      }}
+
+# --- Admin instance RBAC ---
+
+- name: get current headlamp-admin ServiceAccount
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: ServiceAccount
+    name: headlamp-admin
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_admin_sa
+
+- name: create headlamp-admin ServiceAccount
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: headlamp-admin
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+  when: _desired | k3s_content_changed(_current_headlamp_admin_sa.resources[0] | default(none))
+
+- name: get current headlamp-admin ClusterRole
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    name: headlamp-admin
+  register: _current_headlamp_admin_cr
+
+- name: create headlamp-admin ClusterRole
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: headlamp-admin
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      rules:
+        # Read everything cluster-wide
+        - apiGroups: ["*"]
+          resources: ["*"]
+          verbs: [get, list, watch]
+        # Pod delete allows restarting workloads without full deployment control
+        - apiGroups: [""]
+          resources: [pods]
+          verbs: [delete]
+  when: _desired | k3s_content_changed(_current_headlamp_admin_cr.resources[0] | default(none))
+
+- name: get current headlamp-admin ClusterRoleBinding
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    name: headlamp-admin
+  register: _current_headlamp_admin_crb
+
+- name: create headlamp-admin ClusterRoleBinding
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: headlamp-admin
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      subjects:
+        - kind: ServiceAccount
+          name: headlamp-admin
+          namespace: "{{_headlamp_ns}}"
+      roleRef:
+        kind: ClusterRole
+        name: headlamp-admin
+        apiGroup: rbac.authorization.k8s.io
+  when: _desired | k3s_content_changed(_current_headlamp_admin_crb.resources[0] | default(none))
+
+- name: get current headlamp-admin-oidc ClusterRoleBinding
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    name: headlamp-admin-oidc
+  register: _current_headlamp_admin_oidc_crb
+  when: _headlamp_admin_oidc_enabled
+
+- name: create headlamp-admin-oidc ClusterRoleBinding
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: headlamp-admin-oidc
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      subjects:
+        - kind: Group
+          name: "{{cfg_values.admin_oidc_group|default('k3s-admins')}}"
+          apiGroup: rbac.authorization.k8s.io
+      roleRef:
+        kind: ClusterRole
+        name: headlamp-admin
+        apiGroup: rbac.authorization.k8s.io
+  when: _headlamp_admin_oidc_enabled and _desired | k3s_content_changed(_current_headlamp_admin_oidc_crb.resources[0] | default(none))
+
+# --- Admin instance deployment ---
+
+- name: get current headlamp-admin Deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: apps/v1
+    kind: Deployment
+    name: headlamp-admin
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_admin_deploy
+
+- name: deploy headlamp admin instance
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: headlamp-admin
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          app: headlamp-admin
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: headlamp-admin
+        template:
+          metadata:
+            labels:
+              app: headlamp-admin
+          spec:
+            serviceAccountName: headlamp-admin
+            containers:
+              - name: headlamp
+                image: "{{_headlamp_image}}"
+                args: >-
+                  {{
+                    ["-in-cluster"] +
+                    ([
+                      "-oidc-client-id=" + _headlamp_admin_oidc_client_id,
+                      "-oidc-client-secret=$(HEADLAMP_ADMIN_OIDC_CLIENT_SECRET)",
+                      "-oidc-idp-issuer-url=" + _headlamp_admin_oidc_issuer,
+                      "-oidc-scopes=openid,profile,email,groups"
+                    ] if _headlamp_admin_oidc_enabled else [])
+                  }}
+                env: >-
+                  {{
+                    ([{
+                      "name": "HEADLAMP_ADMIN_OIDC_CLIENT_SECRET",
+                      "valueFrom": {
+                        "secretKeyRef": {
+                          "name": "headlamp-admin-oidc",
+                          "key": "client-secret"
+                        }
+                      }
+                    }] if _headlamp_admin_oidc_enabled else [])
+                    + _headlamp_ca_extra_env
+                  }}
+                ports:
+                  - containerPort: 4466
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  runAsNonRoot: true
+                  runAsUser: 100
+                  capabilities:
+                    drop: [ALL]
+                volumeMounts: >-
+                  {{
+                    [
+                      {'name': 'headlamp-config', 'mountPath': '/home/headlamp/.config'},
+                      {'name': 'tmp', 'mountPath': '/tmp'}
+                    ] + _headlamp_ca_extra_mounts
+                  }}
+            volumes: >-
+              {{
+                [_headlamp_admin_config_vol, {'name': 'tmp', 'emptyDir': {}}]
+                + _headlamp_ca_extra_volumes
+              }}
+  when: _desired | k3s_content_changed(_current_headlamp_admin_deploy.resources[0] | default(none))
+
+- name: get current headlamp-admin Service
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: Service
+    name: headlamp-admin
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_admin_svc
+
+- name: create headlamp-admin Service
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: headlamp-admin
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      spec:
+        selector:
+          app: headlamp-admin
+        ports:
+          - port: 4466
+            targetPort: 4466
+  when: _desired | k3s_content_changed(_current_headlamp_admin_svc.resources[0] | default(none))
+
+# ForwardAuth middleware must exist in the same namespace as the Ingress.
+# Create a local copy pointing to the Authelia service in management namespace.
+- name: get current ForwardAuth middleware in headlamp namespace
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: traefik.io/v1alpha1
+    kind: Middleware
+    name: management-auth
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_mw
+
+- name: create ForwardAuth middleware in headlamp namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: traefik.io/v1alpha1
+      kind: Middleware
+      metadata:
+        name: management-auth
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      spec:
+        forwardAuth:
+          address: "http://authelia.{{_headlamp_mgmt_ns}}.svc.cluster.local:9091/api/authz/forward-auth"
+          authResponseHeaders:
+            - Remote-User
+            - Remote-Groups
+            - Remote-Name
+            - Remote-Email
+          trustForwardHeader: true
+  when: _desired | k3s_content_changed(_current_headlamp_mw.resources[0] | default(none))
+
+- name: get current headlamp-admin Ingress
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: networking.k8s.io/v1
+    kind: Ingress
+    name: headlamp-admin
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_admin_ingress
+
+- name: create headlamp-admin Ingress
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: headlamp-admin
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          traefik.ingress.kubernetes.io/router.entrypoints: "{{cfg_values.admin_entrypoint}},{{cfg_values.admin_entrypoint}}-secure"
+          traefik.ingress.kubernetes.io/router.tls: "true"
+          traefik.ingress.kubernetes.io/router.middlewares: "{{_headlamp_ns}}-management-auth@kubernetescrd"
+          forecastle.stakater.com/expose: "true"
+          forecastle.stakater.com/appName: "Cluster Admin Dashboard"
+          forecastle.stakater.com/url: "https://{{cfg_values.admin_hostname}}"
+          forecastle.stakater.com/group: "Operations"
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        rules:
+          - host: "{{cfg_values.admin_hostname}}"
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: headlamp-admin
+                      port:
+                        number: 4466
+  when: _desired | k3s_content_changed(_current_headlamp_admin_ingress.resources[0] | default(none))
+
+# --- User instance ---
+
+- name: resolve OIDC config for user instance
+  ansible.builtin.set_fact:
+    _headlamp_oidc_enabled: "{{cfg_values.oidc_client_secret_passdb is defined}}"
+    _headlamp_oidc_issuer: >-
+      {{cfg_values.oidc_issuer_url
+        | default('https://auth.' + (cfg_values.management_hostname | default(cfg_values.admin_hostname)))}}
+    _headlamp_oidc_client_id: "{{cfg_values.oidc_client_id|default('headlamp-users')}}"
+
+- name: load OIDC client secret from passdb
+  ansible.builtin.set_fact:
+    _headlamp_oidc_secret: "{{lookup(k3s_passdb, cfg_values.oidc_client_secret_passdb)}}"
+  when: _headlamp_oidc_enabled
+
+- name: get current headlamp-user OIDC Secret
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: Secret
+    name: headlamp-user-oidc
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_user_oidc
+  when: _headlamp_oidc_enabled
+
+- name: create headlamp-user OIDC Secret
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: headlamp-user-oidc
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      data:
+        client-secret: "{{_headlamp_oidc_secret | b64encode}}"
+  when: _headlamp_oidc_enabled and _desired | k3s_content_changed(_current_headlamp_user_oidc.resources[0] | default(none))
+
+- name: get current headlamp-user ServiceAccount
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: ServiceAccount
+    name: headlamp-user
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_user_sa
+  when: cfg_values.user_hostname is defined and cfg_values.user_entrypoint is defined
+
+- name: create headlamp-user ServiceAccount
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: headlamp-user
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+  when:
+    - cfg_values.user_hostname is defined
+    - cfg_values.user_entrypoint is defined
+    - _desired | k3s_content_changed(_current_headlamp_user_sa.resources[0] | default(none))
+
+- name: get current headlamp-user Deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: apps/v1
+    kind: Deployment
+    name: headlamp-user
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_user_deploy
+  when: cfg_values.user_hostname is defined and cfg_values.user_entrypoint is defined
+
+- name: deploy headlamp user instance
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: headlamp-user
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          app: headlamp-user
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: headlamp-user
+        template:
+          metadata:
+            labels:
+              app: headlamp-user
+          spec:
+            serviceAccountName: headlamp-user
+            containers:
+              - name: headlamp
+                image: "{{_headlamp_image}}"
+                args: >-
+                  {{
+                    ["-in-cluster"] +
+                    ([
+                      "-oidc-client-id=" + _headlamp_oidc_client_id,
+                      "-oidc-client-secret=$(HEADLAMP_OIDC_CLIENT_SECRET)",
+                      "-oidc-idp-issuer-url=" + _headlamp_oidc_issuer,
+                      "-oidc-scopes=openid,profile,email,groups"
+                    ] if _headlamp_oidc_enabled else [])
+                  }}
+                env: >-
+                  {{
+                    ([{
+                      "name": "HEADLAMP_OIDC_CLIENT_SECRET",
+                      "valueFrom": {
+                        "secretKeyRef": {
+                          "name": "headlamp-user-oidc",
+                          "key": "client-secret"
+                        }
+                      }
+                    }] if _headlamp_oidc_enabled else [])
+                    + _headlamp_ca_extra_env
+                  }}
+                ports:
+                  - containerPort: 4466
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  runAsNonRoot: true
+                  runAsUser: 100
+                  capabilities:
+                    drop: [ALL]
+                volumeMounts: >-
+                  {{
+                    [
+                      {'name': 'headlamp-config', 'mountPath': '/home/headlamp/.config'},
+                      {'name': 'tmp', 'mountPath': '/tmp'}
+                    ] + _headlamp_ca_extra_mounts
+                  }}
+            volumes: >-
+              {{
+                [_headlamp_user_config_vol, {'name': 'tmp', 'emptyDir': {}}]
+                + _headlamp_ca_extra_volumes
+              }}
+  when:
+    - cfg_values.user_hostname is defined
+    - cfg_values.user_entrypoint is defined
+    - _desired | k3s_content_changed(_current_headlamp_user_deploy.resources[0] | default(none))
+
+- name: get current headlamp-user Service
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: v1
+    kind: Service
+    name: headlamp-user
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_user_svc
+  when: cfg_values.user_hostname is defined and cfg_values.user_entrypoint is defined
+
+- name: create headlamp-user Service
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: headlamp-user
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+      spec:
+        selector:
+          app: headlamp-user
+        ports:
+          - port: 4466
+            targetPort: 4466
+  when:
+    - cfg_values.user_hostname is defined
+    - cfg_values.user_entrypoint is defined
+    - _desired | k3s_content_changed(_current_headlamp_user_svc.resources[0] | default(none))
+
+# No ForwardAuth middleware on user ingress — Headlamp handles its own auth
+- name: get current headlamp-user Ingress
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: networking.k8s.io/v1
+    kind: Ingress
+    name: headlamp-user
+    namespace: "{{_headlamp_ns}}"
+  register: _current_headlamp_user_ingress
+  when: cfg_values.user_hostname is defined and cfg_values.user_entrypoint is defined
+
+- name: create headlamp-user Ingress
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: headlamp-user
+        namespace: "{{_headlamp_ns}}"
+        labels:
+          configurator: ansible
+        annotations:
+          traefik.ingress.kubernetes.io/router.entrypoints: "{{cfg_values.user_entrypoint}},{{cfg_values.user_entrypoint}}-secure"
+          traefik.ingress.kubernetes.io/router.tls: "true"
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        rules:
+          - host: "{{cfg_values.user_hostname}}"
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: headlamp-user
+                      port:
+                        number: 4466
+  when:
+    - cfg_values.user_hostname is defined
+    - cfg_values.user_entrypoint is defined
+    - _desired | k3s_content_changed(_current_headlamp_user_ingress.resources[0] | default(none))
