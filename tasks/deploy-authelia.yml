@@ -367,6 +367,24 @@
             targetPort: 9091
   when: _desired | k3s_content_changed(_current_authelia_svc.resources[0] | default(none))
 
+# --- Optional TLS certificate ---
+# Delegates to shared module when tls_cert_passdb is set.  Otherwise the
+# Ingress relies on the cluster-wide TLSStore default (or ACME-managed
+# cert referenced below).
+
+- name: manage TLS certificates
+  include_role:
+    name: k3s
+    tasks_from: manage_certificates.yml
+  vars:
+    _k3s_cert:
+      name: "{{cfg_values.name|default('authelia')}}-tls"
+      namespace: "{{cfg_values.namespace|default('management')}}"
+      cert_passdb: "{{cfg_values.tls_cert_passdb}}"
+      key_passdb: "{{cfg_values.tls_key_passdb}}"
+      generate: "{{cfg_values.tls_generate|default(omit)}}"
+  when: cfg_values.tls_cert_passdb is defined
+
 - name: get current Authelia Ingress
   kubernetes.core.k8s_info:
     kubeconfig: "{{_k3s_kubecfg}}"
@@ -377,14 +395,9 @@
   register: _current_authelia_ingress
 
 # Authelia portal ingress — no auth middleware, this is the auth endpoint
-- name: create Authelia portal Ingress
-  kubernetes.core.k8s:
-    kubeconfig: "{{_k3s_kubecfg}}"
-    state: present
-    apply: yes
-    definition: "{{_desired}}"
-  vars:
-    _desired:
+- name: build Authelia portal Ingress definition
+  set_fact:
+    _authelia_ingress_desired:
       apiVersion: networking.k8s.io/v1
       kind: Ingress
       metadata:
@@ -410,4 +423,16 @@
                       name: "{{cfg_values.name|default('authelia')}}"
                       port:
                         number: 9091
-  when: _desired | k3s_content_changed(_current_authelia_ingress.resources[0] | default(none))
+
+- name: add TLS block to Authelia portal Ingress
+  set_fact:
+    _authelia_ingress_desired: "{{_authelia_ingress_desired | combine({'spec': {'tls': [{'hosts': ['auth.' ~ cfg_values.hostname], 'secretName': (cfg_values.name | default('authelia')) ~ '-tls'}], 'rules': _authelia_ingress_desired.spec.rules}})}}"
+  when: cfg_values.tls_cert_passdb is defined
+
+- name: create Authelia portal Ingress
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_authelia_ingress_desired}}"
+  when: _authelia_ingress_desired | k3s_content_changed(_current_authelia_ingress.resources[0] | default(none))
