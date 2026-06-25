@@ -81,6 +81,18 @@
     name: management-auth
     namespace: kube-system
 
+- name: remove TLS certificates
+  include_role:
+    name: k3s
+    tasks_from: destroy_certificates.yml
+  vars:
+    _k3s_cert:
+      name: "management-tls"
+      namespace: "{{cfg_values.namespace|default('management')}}"
+      tlsstore: true
+      tlsstore_name: "default"
+  when: cfg_values.tls_cert_passdb is defined
+
 - name: remove management namespace
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
