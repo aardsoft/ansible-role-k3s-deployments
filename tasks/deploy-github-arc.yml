@@ -201,6 +201,76 @@
   loop_control:
     loop_var: _set
 
+# ARC controllers own EphemeralRunnerSets and AutoscalingRunnerSets. When the
+# controller is uninstalled, these CRs are orphaned. The new controller creates
+# listener pods that try to patch the old names and crash. Clean them up
+# explicitly before uninstalling the controller.
+- name: query ephemeral runner sets before upgrade
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: actions.github.com/v1alpha1
+    kind: EphemeralRunnerSet
+    namespace: "{{_gh_arc_runner_ns}}"
+  register: _all_ers
+  when: >
+    _arc_is_deployed and
+    cfg_values.upgrade|default(false)|bool
+
+- name: build ephemeral runner set name list
+  set_fact:
+    _orphan_ers: "{{ (_all_ers.resources | default([])) | map(attribute='metadata.name') | list }}"
+  when: >
+    _arc_is_deployed and
+    cfg_values.upgrade|default(false)|bool
+
+- name: remove orphaned ephemeral runner sets before upgrade
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: actions.github.com/v1alpha1
+    kind: EphemeralRunnerSet
+    namespace: "{{_gh_arc_runner_ns}}"
+    name: "{{item}}"
+  loop: "{{_orphan_ers | default([])}}"
+  loop_control:
+    label: "{{item}}"
+  when: >
+    _arc_is_deployed and
+    cfg_values.upgrade|default(false)|bool
+
+- name: query autoscaling runner sets before upgrade
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: actions.github.com/v1alpha1
+    kind: AutoscalingRunnerSet
+    namespace: "{{_gh_arc_runner_ns}}"
+  register: _all_ars
+  when: >
+    _arc_is_deployed and
+    cfg_values.upgrade|default(false)|bool
+
+- name: build autoscaling runner set name list
+  set_fact:
+    _orphan_ars: "{{ (_all_ars.resources | default([])) | map(attribute='metadata.name') | list }}"
+  when: >
+    _arc_is_deployed and
+    cfg_values.upgrade|default(false)|bool
+
+- name: remove orphaned autoscaling runner sets before upgrade
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: actions.github.com/v1alpha1
+    kind: AutoscalingRunnerSet
+    namespace: "{{_gh_arc_runner_ns}}"
+    name: "{{item}}"
+  loop: "{{_orphan_ars | default([])}}"
+  loop_control:
+    label: "{{item}}"
+  when: >
+    _arc_is_deployed and
+    cfg_values.upgrade|default(false)|bool
+
 - name: uninstall controller before upgrade
   kubernetes.core.helm:
     kubeconfig: "{{_k3s_kubecfg}}"
