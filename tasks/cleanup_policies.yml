@@ -1,0 +1,30 @@
+# Shared policy cleanup for k3s-deployments.
+#
+# Removes a list of NetworkPolicies when the cluster no longer has
+# network_policies enabled.  Call at the top of a deploy task before
+# the "get current" query so stale policies from a previous run are
+# cleaned up before the conditional create logic runs.
+#
+# Variables:
+#   _stale_policies  — list of {name, namespace} dicts
+#
+# Example usage in a deploy task:
+#   - name: remove stale arc-system policies
+#     include_tasks: cleanup_policies.yml
+#     vars:
+#       _stale_policies:
+#         - {name: allow-https-egress, namespace: "{{_gh_arc_system_ns}}"}
+#     when: not (_k3s_np_enabled | default(false) | bool)
+
+- name: remove stale NetworkPolicies
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: networking.k8s.io/v1
+    kind: NetworkPolicy
+    name: "{{item.name}}"
+    namespace: "{{item.namespace}}"
+  loop: "{{_stale_policies}}"
+  loop_control:
+    label: "{{item.namespace}}/{{item.name}}"
+  when: not (_k3s_np_enabled | default(false) | bool)
