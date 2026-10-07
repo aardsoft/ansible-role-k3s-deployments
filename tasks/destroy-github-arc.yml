@@ -19,6 +19,15 @@
     name: "{{cfg_values.arc_name|default('arc')}}"
     state: absent
 
+- name: remove arc-system allow-https-egress policy
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: networking.k8s.io/v1
+    kind: NetworkPolicy
+    name: allow-https-egress
+    namespace: "{{_gh_arc_system_ns}}"
+
 - name: remove arc-system namespace
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
