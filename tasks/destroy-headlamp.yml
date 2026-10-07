@@ -14,6 +14,16 @@
     kind: ClusterRole
     name: headlamp-admin
 
+- name: remove headlamp allow-to-management network policy
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: networking.k8s.io/v1
+    kind: NetworkPolicy
+    name: allow-to-management
+    namespace: "{{cfg_values.namespace|default('headlamp')}}"
+  ignore_errors: true
+
 - name: remove headlamp namespace
   kubernetes.core.k8s:
     kubeconfig: "{{_k3s_kubecfg}}"
