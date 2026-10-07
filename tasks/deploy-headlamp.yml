@@ -477,6 +477,7 @@
           metadata:
             labels:
               app: headlamp-admin
+              network/cluster-service: "true"
           spec:
             serviceAccountName: headlamp-admin
             containers:
@@ -489,6 +490,7 @@
                       "-oidc-client-id=" + _headlamp_admin_oidc_client_id,
                       "-oidc-client-secret=$(HEADLAMP_ADMIN_OIDC_CLIENT_SECRET)",
                       "-oidc-idp-issuer-url=" + _headlamp_admin_oidc_issuer,
+                      "-oidc-callback-url=https://" + cfg_values.admin_hostname + "/oidc-callback",
                       "-oidc-scopes=openid,profile,email,groups"
                     ] if _headlamp_admin_oidc_enabled else [])
                   }}
@@ -767,6 +769,7 @@
           metadata:
             labels:
               app: headlamp-user
+              network/cluster-service: "true"
           spec:
             serviceAccountName: headlamp-user
             containers:
