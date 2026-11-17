@@ -75,8 +75,11 @@ customConfig:
       encoding:
         codec: text
       labels:
-        job: '{% raw %}{{ "{{" }} job {{ "}}" }}{% endraw %}'
-        cluster: '{% raw %}{{ "{{" }} cluster {{ "}}" }}{% endraw %}'
-        namespace: '{% raw %}{{ "{{" }} kubernetes.namespace_name {{ "}}" }}{% endraw %}'
-        pod: '{% raw %}{{ "{{" }} kubernetes.pod_name {{ "}}" }}{% endraw %}'
-        container: '{% raw %}{{ "{{" }} kubernetes.container_name {{ "}}" }}{% endraw %}'
+        # Vector >= 0.57 requires a static prefix on templates for confinement.
+        # Adding a prefix here changes the stored label values (e.g. ns/default).
+        # No existing data to preserve, so this is safe.
+        job: 'job/{% raw %}{{ "{{" }} job {{ "}}" }}{% endraw %}'
+        cluster: 'cluster/{% raw %}{{ "{{" }} cluster {{ "}}" }}{% endraw %}'
+        namespace: 'ns/{% raw %}{{ "{{" }} kubernetes.namespace_name {{ "}}" }}{% endraw %}'
+        pod: 'pod/{% raw %}{{ "{{" }} kubernetes.pod_name {{ "}}" }}{% endraw %}'
+        container: 'container/{% raw %}{{ "{{" }} kubernetes.container_name {{ "}}" }}{% endraw %}'
