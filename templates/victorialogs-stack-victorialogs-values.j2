@@ -27,3 +27,10 @@ server:
     # Suppress noisy startup/shutdown messages from the flags library.
     envflag.enable: "true"
     envflag.prefix: VM_
+    # Cap storage usage: the retention loop deletes oldest per-day partitions
+    # until usage is under the cap, so a log burst cannot wedge the stack.
+    # Without it, a full disk flips VictoriaLogs into read-only mode, which
+    # also halts retention deletion — a full disk then stops defending itself.
+    # Cap is in GiB, the flag wants bytes; it always keeps the newest 2 days
+    # regardless of the cap.  Keep headroom below the PVC size for compaction.
+    retention.maxDiskSpaceUsageBytes: "{{(cfg_values.retention_space_cap_gib|default(8)) | int * 1073741824}}"

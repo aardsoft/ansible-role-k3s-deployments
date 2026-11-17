@@ -30,6 +30,11 @@
 #   storage_class:          PVC storage class                (default: longhorn)
 #   storage_size:           VictoriaLogs PVC size            (default: 10Gi)
 #   retention_period:       Log retention period             (default: 30d)
+#   retention_space_cap_gib: Max storage usage in GiB before the retention
+#                           loop drops oldest per-day partitions (default: 8).
+#                           Must stay below storage_size so compaction keeps
+#                           working space; the cap is what keeps a log burst
+#                           from wedging the stack in read-only mode.
 #   victorialogs_ip:        metallb LoadBalancer IP for direct API access (optional)
 #                           API access (port 9428) bypasses Traefik auth for
 #                           programmatic/log pipeline use without management-ui
@@ -53,6 +58,7 @@
 #           storage_class: longhorn
 #           storage_size: 10Gi
 #           retention_period: 30d
+#           retention_space_cap_gib: 8
 #           victorialogs_ip: 192.168.33.130
 #           cluster_label: storage1
 
