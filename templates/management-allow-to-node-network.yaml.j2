@@ -1,0 +1,31 @@
+#jinja2: lstrip_blocks: True, trim_blocks: True
+# Renders an egress NetworkPolicy (allow-to-node-network) for the management
+# namespace so pods can reach the k3s node network CIDRs.  default-deny-all
+# blocks all egress; Forecastle and other management pods need to talk to the
+# Kubernetes API server which lives on node IPs :6443.
+# CIDRs come from _k3s_cfg.network_policies.k3s_cidrs (IPv4 + IPv6).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-to-node-network
+  namespace: {{cfg_values.namespace|default('management')}}
+  labels:
+    # app.kubernetes.io/managed-by, NOT configurator=ansible: the k3s role's
+    # stale-policy cleanup deletes configurator=ansible policies in excluded
+    # namespaces whose names are not in its expected list; this policy is
+    # owned by deploy-management-ui.yml
+    app.kubernetes.io/managed-by: k3s-deployments
+  annotations:
+    ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+    ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+    ansible.version: "{{ansible_version.full}}"
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+{% for cidr in _mgmt_node_cidrs %}
+    - ipBlock:
+        cidr: {{cidr}}
+{% endfor %}

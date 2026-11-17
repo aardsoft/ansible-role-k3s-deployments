@@ -110,6 +110,249 @@
           ansible.version: "{{ansible_version.full}}"
   when: _desired | k3s_content_changed(_current_mgmt_ns.resources[0] | default(none))
 
+# The management namespace is not covered by the k3s role's system network
+# policies (it is in excluded_namespaces), so we define the minimal set here.
+# These policies allow Traefik (kube-system) to reach Authelia and Forecastle,
+# and allow management pods to resolve DNS and reach cluster services.
+#
+# Required policies:
+#   allow-dns-egress          -> CoreDNS (kube-system)
+#   allow-to-kube-system      -> kube-system services (kubernetes, CoreDNS)
+#   allow-from-kube-system    -> Traefik ingress to management pods
+#   allow-intra-namespace     -> authelia <-> forecastle
+#   allow-to-node-network     -> API server (forecastle reads ingresses)
+
+- name: remove stale management-ui policies
+  include_tasks: cleanup_policies.yml
+  vars:
+    _stale_policies:
+      - {name: default-deny-all, namespace: "{{cfg_values.namespace|default('management')}}"}
+      - {name: allow-dns-egress, namespace: "{{cfg_values.namespace|default('management')}}"}
+      - {name: allow-to-kube-system, namespace: "{{cfg_values.namespace|default('management')}}"}
+      - {name: allow-from-kube-system, namespace: "{{cfg_values.namespace|default('management')}}"}
+      - {name: allow-intra-namespace, namespace: "{{cfg_values.namespace|default('management')}}"}
+      - {name: allow-to-node-network, namespace: "{{cfg_values.namespace|default('management')}}"}
+      - {name: allow-to-management, namespace: kube-system}
+
+- name: get current management network policies
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: networking.k8s.io/v1
+    kind: NetworkPolicy
+    namespace: "{{cfg_values.namespace|default('management')}}"
+  register: _current_mgmt_netpols
+  when: _k3s_np_enabled | default(false) | bool
+
+- name: create management network policies
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{item}}"
+  loop:
+    - apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: default-deny-all
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          # app.kubernetes.io/managed-by, NOT configurator=ansible: the k3s
+          # role's stale-policy cleanup deletes configurator=ansible policies
+          # in excluded namespaces whose names are not in its expected list
+          # (previously ate allow-intra-namespace-ingress here); these are
+          # owned by this task, not the k3s network-policy templates
+          app.kubernetes.io/managed-by: k3s-deployments
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        podSelector: {}
+        policyTypes:
+        - Ingress
+        - Egress
+
+    - apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: allow-dns-egress
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          app.kubernetes.io/managed-by: k3s-deployments
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        podSelector: {}
+        policyTypes:
+        - Egress
+        egress:
+        - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: kube-system
+            podSelector:
+              matchLabels:
+                k8s-app: kube-dns
+          ports:
+          - port: 53
+            protocol: UDP
+          - port: 53
+            protocol: TCP
+
+    - apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: allow-to-kube-system
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          app.kubernetes.io/managed-by: k3s-deployments
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        podSelector: {}
+        policyTypes:
+        - Egress
+        egress:
+        - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: kube-system
+
+    - apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: allow-from-kube-system
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          app.kubernetes.io/managed-by: k3s-deployments
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        podSelector: {}
+        policyTypes:
+        - Ingress
+        ingress:
+        - from:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: kube-system
+
+    - apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: allow-intra-namespace
+        namespace: "{{cfg_values.namespace|default('management')}}"
+        labels:
+          app.kubernetes.io/managed-by: k3s-deployments
+        annotations:
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        podSelector: {}
+        policyTypes:
+        - Ingress
+        - Egress
+        ingress:
+        - from:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: "{{cfg_values.namespace|default('management')}}"
+        egress:
+        - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: "{{cfg_values.namespace|default('management')}}"
+
+  vars:
+    _desired: "{{item}}"
+    _current: "{{ (_current_mgmt_netpols.resources | selectattr('metadata.name', 'equalto', item.metadata.name) | list | first) | default(none) }}"
+  when:
+    - _k3s_np_enabled | default(false) | bool
+    - _desired | k3s_content_changed(_current)
+
+# allow-to-node-network is built separately because it needs to loop over
+# multiple CIDRs (IPv4 + IPv6) from the cluster config.
+- name: build allow-to-node-network CIDR list
+  set_fact:
+    _mgmt_node_cidrs: "{{ _k3s_cfg.network_policies.k3s_cidrs | default(_k3s_cfg.k3s_cidrs) | default(['172.31.248.0/24', 'fd42:172:31:248::/64']) }}"
+  when: _k3s_np_enabled | default(false) | bool
+
+- name: get current allow-to-node-network policy
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: networking.k8s.io/v1
+    kind: NetworkPolicy
+    name: allow-to-node-network
+    namespace: "{{cfg_values.namespace|default('management')}}"
+  register: _current_mgmt_node_netpol
+  when: _k3s_np_enabled | default(false) | bool
+
+- name: create allow-to-node-network policy
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{lookup('template', 'management-allow-to-node-network.yaml.j2') | from_yaml}}"
+  vars:
+    _mgmt_node_cidrs: "{{ _k3s_cfg.network_policies.k3s_cidrs | default(_k3s_cfg.k3s_cidrs) | default(['172.31.248.0/24', 'fd42:172:31:248::/64']) }}"
+    _desired: "{{lookup('template', 'management-allow-to-node-network.yaml.j2') | from_yaml}}"
+  when:
+    - _k3s_np_enabled | default(false) | bool
+    - _desired | k3s_content_changed(_current_mgmt_node_netpol.resources[0] | default(none))
+
+# Traefik (kube-system) needs explicit egress to the management namespace.
+# The k3s role's system network policies only cover system_namespaces; management
+# is excluded, so we add the kube-system side here.
+- name: get current allow-to-management policy in kube-system
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    api_version: networking.k8s.io/v1
+    kind: NetworkPolicy
+    name: allow-to-management
+    namespace: kube-system
+  register: _current_kubesys_mgmt_netpol
+  when: _k3s_np_enabled | default(false) | bool
+
+- name: create allow-to-management policy in kube-system
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: present
+    apply: yes
+    definition: "{{_desired}}"
+  vars:
+    _desired:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: allow-to-management
+        namespace: kube-system
+        labels:
+          app.kubernetes.io/managed-by: k3s-deployments
+        annotations:
+          description: "Allows Traefik (kube-system) to reach management namespace pods"
+          ansible.run-id: "{{ansible_run_id|default('N/A')}}"
+          ansible.config_file: "{{ansible_config_file|default('N/A')}}"
+          ansible.version: "{{ansible_version.full}}"
+      spec:
+        podSelector: {}
+        policyTypes:
+        - Egress
+        egress:
+        - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: "{{cfg_values.namespace|default('management')}}"
+  when:
+    - _k3s_np_enabled | default(false) | bool
+    - _desired | k3s_content_changed(_current_kubesys_mgmt_netpol.resources[0] | default(none))
+
 - name: check management middlewares for stale basicAuth spec
   kubernetes.core.k8s_info:
     kubeconfig: "{{_k3s_kubecfg}}"
@@ -308,4 +551,3 @@
       tlsstore: true
       tlsstore_name: "default"
   when: cfg_values.tls_cert_passdb is defined
-

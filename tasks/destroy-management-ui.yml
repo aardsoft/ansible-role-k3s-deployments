@@ -81,6 +81,34 @@
     name: management-auth
     namespace: kube-system
 
+- name: remove management network policies
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: networking.k8s.io/v1
+    kind: NetworkPolicy
+    name: "{{item}}"
+    namespace: "{{cfg_values.namespace|default('management')}}"
+  loop:
+    - default-deny-all
+    - allow-dns-egress
+    - allow-to-kube-system
+    - allow-from-kube-system
+    - allow-intra-namespace
+    - allow-intra-namespace-ingress
+    - allow-to-node-network
+  ignore_errors: true
+
+- name: remove kube-system allow-to-management policy
+  kubernetes.core.k8s:
+    kubeconfig: "{{_k3s_kubecfg}}"
+    state: absent
+    api_version: networking.k8s.io/v1
+    kind: NetworkPolicy
+    name: allow-to-management
+    namespace: kube-system
+  ignore_errors: true
+
 - name: remove TLS certificates
   include_role:
     name: k3s
